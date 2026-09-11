@@ -4995,7 +4995,7 @@ class HDXFViewerApp:
     def __init__(self, root: tk.Misc, manager: ViewerWorkspaceManager, initial_path: Path | None = None) -> None:
         self.root = root
         self.manager = manager
-        self.root.title("HDXF Viewer 0.5.2.0 · HDF5 · ROI DEEPER BLUE SHADE · MOVE + RESIZE")
+        self.root.title("HDXF Viewer 0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE")
         ui_scale = float(getattr(self.root, "_hdxf_ui_scale", 1.0))
         screen_w = max(1, int(self.root.winfo_screenwidth()))
         screen_h = max(1, int(self.root.winfo_screenheight()))
@@ -5106,6 +5106,7 @@ class HDXFViewerApp:
         self._processing_run_serial = 0
         self._processing_poll_after_id: str | None = None
         self._processing_kind: str | None = None
+        self._processing_family = "hdxf"
         self._processing_output_path: Path | None = None
         self._processing_start_time: float | None = None
         self._processing_stop_requested = False
@@ -5163,7 +5164,7 @@ class HDXFViewerApp:
         brand_text = ttk.Frame(brand, style="Topbar.TFrame")
         brand_text.pack(side="left", anchor="center")
         ttk.Label(brand_text, text="HDXF VIEWER", style="Brand.TLabel").pack(anchor="w")
-        ttk.Label(brand_text, text="DETECTOR WORKSPACE  ·  0.5.2.0 · HDF5 · ROI DEEPER BLUE SHADE · MOVE + RESIZE", style="BrandSub.TLabel").pack(anchor="w")
+        ttk.Label(brand_text, text="DETECTOR WORKSPACE  ·  0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE", style="BrandSub.TLabel").pack(anchor="w")
 
         def toolbar_group(title: str) -> ttk.Frame:
             outer = ttk.Frame(topbar, style="ToolbarGroup.TFrame", padding=(9, 5))
@@ -5189,6 +5190,20 @@ class HDXFViewerApp:
         ttk.Button(
             processing_tools, text="± Pixel Op", style="Toolbar.TButton",
             command=self.open_hdxf_pixelop_tool,
+        ).pack(side="left", padx=(5, 0))
+
+        hdf5_processing_tools = toolbar_group("HDF5 PROCESS")
+        ttk.Button(
+            hdf5_processing_tools, text="Σ H5", style="Toolbar.TButton",
+            command=self.open_hdf5_sum_tool,
+        ).pack(side="left")
+        ttk.Button(
+            hdf5_processing_tools, text="− H5", style="Toolbar.TButton",
+            command=self.open_hdf5_subtract_tool,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Button(
+            hdf5_processing_tools, text="± H5", style="Toolbar.TButton",
+            command=self.open_hdf5_pixelop_tool,
         ).pack(side="left", padx=(5, 0))
 
         viewport = toolbar_group("VIEWPORT")
@@ -5327,6 +5342,12 @@ class HDXFViewerApp:
             command=self.open_hdxf_pixelop_tool,
             accelerator="Ctrl+Alt+P",
         )
+        tools_menu.add_separator()
+        hdf5_processing_menu = tk.Menu(tools_menu, **menu_options)
+        hdf5_processing_menu.add_command(label="Sum / Mean…", command=self.open_hdf5_sum_tool)
+        hdf5_processing_menu.add_command(label="Subtract / Filter…", command=self.open_hdf5_subtract_tool)
+        hdf5_processing_menu.add_command(label="Pixel Operation…", command=self.open_hdf5_pixelop_tool)
+        tools_menu.add_cascade(label="HDF5 Processing", menu=hdf5_processing_menu)
         tools_menu.add_separator()
         tools_menu.add_command(
             label="HDF5 → HDXF Converter…",
@@ -7398,15 +7419,27 @@ class HDXFViewerApp:
         return Path(__file__).resolve().with_name("hdxf_pixelop.py")
 
     def open_hdxf_sum_tool(self) -> None:
-        self._open_hdxf_processing_tool("sum")
+        self._open_hdxf_processing_tool("sum", family="hdxf")
 
     def open_hdxf_subtract_tool(self) -> None:
-        self._open_hdxf_processing_tool("subtract")
+        self._open_hdxf_processing_tool("subtract", family="hdxf")
 
     def open_hdxf_pixelop_tool(self) -> None:
-        self._open_hdxf_processing_tool("pixelop")
+        self._open_hdxf_processing_tool("pixelop", family="hdxf")
 
-    def _processing_script_path(self, kind: str | None = None) -> Path:
+    def open_hdf5_sum_tool(self) -> None:
+        self._open_hdxf_processing_tool("sum", family="hdf5")
+
+    def open_hdf5_subtract_tool(self) -> None:
+        self._open_hdxf_processing_tool("subtract", family="hdf5")
+
+    def open_hdf5_pixelop_tool(self) -> None:
+        self._open_hdxf_processing_tool("pixelop", family="hdf5")
+
+    def _processing_script_path(self, kind: str | None = None, family: str | None = None) -> Path:
+        selected_family = family or self._processing_family
+        if selected_family == "hdf5":
+            return Path(__file__).resolve().with_name("hdf5_processing_tree.py")
         selected = kind or self._processing_kind or "sum"
         if selected == "subtract":
             return self._subtract_script_path()
@@ -7422,12 +7455,25 @@ class HDXFViewerApp:
             return None
         return view.archive.path
 
-    def _open_hdxf_processing_tool(self, kind: str) -> None:
+    def _active_hdf5_path(self) -> Path | None:
+        view = self.active_view
+        if view is None or view.archive is None:
+            return None
+        if getattr(view.archive, "file_format", "") != "HDF5":
+            return None
+        return view.archive.path
+
+    def _open_hdxf_processing_tool(self, kind: str, *, family: str = "hdxf") -> None:
         if kind not in ("sum", "subtract", "pixelop"):
             raise ValueError(kind)
-        script = self._processing_script_path(kind)
+        if family not in ("hdxf", "hdf5"):
+            raise ValueError(family)
+        script = self._processing_script_path(kind, family)
         if not script.is_file():
-            expected = {"sum": "hdxf_sum.py", "subtract": "hdxf_subtract.py", "pixelop": "hdxf_pixelop.py"}[kind]
+            expected = (
+                "hdf5_processing_tree.py" if family == "hdf5" else
+                {"sum": "hdxf_sum.py", "subtract": "hdxf_subtract.py", "pixelop": "hdxf_pixelop.py"}[kind]
+            )
             messagebox.showerror(
                 "Processing tool not found",
                 f"{expected} was not found next to hdxf_viewer.py.\n\nExpected location:\n{script}",
@@ -7437,12 +7483,12 @@ class HDXFViewerApp:
 
         if self._processing_panel is not None and self._processing_panel.winfo_exists():
             process = self._processing_process
-            if self._processing_kind == kind:
+            if self._processing_kind == kind and self._processing_family == family:
                 self._processing_panel.lift()
                 return
             if process is not None and process.poll() is None:
                 messagebox.showinfo(
-                    "HDXF processing is running",
+                    f"{self._processing_family.upper()} processing is running",
                     "Stop the current processing job before switching tools.",
                     parent=self.root,
                 )
@@ -7451,6 +7497,7 @@ class HDXFViewerApp:
             self._close_processing_tool(force=True)
 
         self._processing_kind = kind
+        self._processing_family = family
         self._processing_output_path = None
         self._processing_output_auto = True
         self._processing_stop_requested = False
@@ -7473,12 +7520,18 @@ class HDXFViewerApp:
             "sum": "HDXF SUM / MEAN",
             "subtract": "HDXF SUBTRACT / FILTER",
             "pixelop": "HDXF PIXEL OPERATION",
+        }[kind].replace("HDXF", "HDF5") if family == "hdf5" else {
+            "sum": "HDXF SUM / MEAN",
+            "subtract": "HDXF SUBTRACT / FILTER",
+            "pixelop": "HDXF PIXEL OPERATION",
         }[kind]
         subtitle = {
             "sum": "Combine selected HDXF frames into one derived frame",
             "subtract": "Apply background subtraction, thresholds and ROI protection directly to HDXF frames",
             "pixelop": "Add, subtract, multiply or divide selected pixels directly in HDXF frames",
-        }[kind]
+        }[kind].replace("HDXF", "HDF5")
+        if family == "hdf5" and kind == "sum":
+            subtitle = "Create a one-frame HDF5 master/data bundle using the current HDF5 tree as its template"
         ttk.Label(title_area, text=title, style="InspectorTitle.TLabel").pack(anchor="w")
         ttk.Label(title_area, text=subtitle, style="CardSubtitle.TLabel").pack(anchor="w", pady=(2, 0))
 
@@ -7486,15 +7539,15 @@ class HDXFViewerApp:
         switch.pack(side="right", padx=(12, 10))
         ttk.Button(
             switch, text="Sum / Mean", style="Accent.TButton" if kind == "sum" else "Secondary.TButton",
-            command=self.open_hdxf_sum_tool,
+            command=self.open_hdf5_sum_tool if family == "hdf5" else self.open_hdxf_sum_tool,
         ).pack(side="left")
         ttk.Button(
             switch, text="Subtract / Filter", style="Accent.TButton" if kind == "subtract" else "Secondary.TButton",
-            command=self.open_hdxf_subtract_tool,
+            command=self.open_hdf5_subtract_tool if family == "hdf5" else self.open_hdxf_subtract_tool,
         ).pack(side="left", padx=(6, 0))
         ttk.Button(
             switch, text="Pixel Op", style="Accent.TButton" if kind == "pixelop" else "Secondary.TButton",
-            command=self.open_hdxf_pixelop_tool,
+            command=self.open_hdf5_pixelop_tool if family == "hdf5" else self.open_hdxf_pixelop_tool,
         ).pack(side="left", padx=(6, 0))
         ttk.Button(header, text="Close", style="Secondary.TButton", command=self._close_processing_tool).pack(side="right")
 
@@ -7553,10 +7606,10 @@ class HDXFViewerApp:
                 entry.bind("<KeyRelease>", lambda _e: setattr(self, "_processing_output_auto", False))
             return entry
 
-        path_row(0, "INPUT HDXF", self.processing_input_var, self._browse_processing_input)
+        path_row(0, "INPUT HDF5" if family == "hdf5" else "INPUT HDXF", self.processing_input_var, self._browse_processing_input)
         path_row(
             1,
-            "OUTPUT HDXF" if kind == "sum" else "OUTPUT FOLDER",
+            "OUTPUT MASTER HDF5" if family == "hdf5" else ("OUTPUT HDXF" if kind == "sum" else "OUTPUT FOLDER"),
             self.processing_output_var,
             self._browse_processing_output,
             output=True,
@@ -7595,10 +7648,17 @@ class HDXFViewerApp:
                 values=("auto", "source", "int16", "int32", "int64", "uint16", "uint32", "uint64", "float32", "float64"),
                 style="Modern.TCombobox", width=14,
             ).grid(row=0, column=3, sticky="ew")
-            ttk.Checkbutton(
-                options, text="Keep /entry/azint metadata", variable=self.processing_keep_azint_var,
-                style="Modern.TCheckbutton",
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            if family == "hdf5":
+                ttk.Label(
+                    options,
+                    text="The source master/data tree is used as the output template; frame-dependent values are updated.",
+                    style="CardSubtitle.TLabel",
+                ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
+            else:
+                ttk.Checkbutton(
+                    options, text="Keep /entry/azint metadata", variable=self.processing_keep_azint_var,
+                    style="Modern.TCheckbutton",
+                ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
         elif kind == "subtract":
             options = ttk.Frame(form, style="Card.TFrame")
             options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(5, 4))
@@ -7624,7 +7684,7 @@ class HDXFViewerApp:
             ttk.Label(options, text="UPPER THRESHOLD", style="FieldLabel.TLabel").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=4)
             ttk.Entry(options, textvariable=self.processing_upper_var, style="Modern.TEntry").grid(row=1, column=3, sticky="ew", pady=4)
 
-            ttk.Label(options, text="BACKGROUND HDXF", style="FieldLabel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Label(options, text="BACKGROUND HDF5" if family == "hdf5" else "BACKGROUND HDXF", style="FieldLabel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
             background_row = ttk.Frame(options, style="Card.TFrame")
             background_row.grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
             background_row.grid_columnconfigure(0, weight=1)
@@ -7647,7 +7707,11 @@ class HDXFViewerApp:
             self.processing_remove_high_entry.grid(row=0, column=2, sticky="ew")
 
             ttk.Label(options, text="PROTECT ROI", style="FieldLabel.TLabel").grid(row=3, column=2, sticky="w", padx=(0, 8), pady=4)
-            ttk.Entry(options, textvariable=self.processing_protect_var, style="Modern.TEntry").grid(row=3, column=3, sticky="ew", pady=4)
+            protect_row = ttk.Frame(options, style="Card.TFrame")
+            protect_row.grid(row=3, column=3, sticky="ew", pady=4)
+            protect_row.grid_columnconfigure(0, weight=1)
+            ttk.Entry(protect_row, textvariable=self.processing_protect_var, style="Modern.TEntry").grid(row=0, column=0, sticky="ew")
+            ttk.Button(protect_row, text="Current ROI", style="Secondary.TButton", command=self._processing_use_current_roi).grid(row=0, column=1, padx=(7, 0))
             ttk.Label(options, text="Format: x0,y0,x1,y1", style="CardSubtitle.TLabel").grid(row=4, column=3, sticky="w", pady=(0, 4))
 
             encode = ttk.Frame(options, style="CardAlt.TFrame", padding=(9, 7))
@@ -7669,6 +7733,8 @@ class HDXFViewerApp:
                 values=tuple(str(i) for i in range(10)), style="Modern.TCombobox", width=6,
             ).grid(row=0, column=5, sticky="ew")
             self._processing_mode_changed()
+            if family == "hdf5":
+                encode.grid_remove()
 
         else:  # pixelop
             options = ttk.Frame(form, style="Card.TFrame")
@@ -7697,7 +7763,10 @@ class HDXFViewerApp:
             )
             ttk.Entry(
                 options, textvariable=self.processing_pixelop_roi_var, style="Modern.TEntry"
-            ).grid(row=1, column=1, columnspan=3, sticky="ew", pady=4)
+            ).grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+            ttk.Button(
+                options, text="Current ROI", style="Secondary.TButton", command=self._processing_use_current_roi,
+            ).grid(row=1, column=3, sticky="e", padx=(7, 0), pady=4)
             ttk.Label(
                 options,
                 text="Optional: x1,y1,x2,y2 · 0-based inclusive. Pixels outside ROI are copied unchanged.",
@@ -7722,6 +7791,8 @@ class HDXFViewerApp:
                 encode, state="readonly", textvariable=self.processing_zstd_level_var,
                 values=tuple(str(i) for i in range(10)), style="Modern.TCombobox", width=6,
             ).grid(row=0, column=5, sticky="ew")
+            if family == "hdf5":
+                encode.grid_remove()
 
         flags = ttk.Frame(form, style="Card.TFrame")
         flags.grid(row=4, column=0, columnspan=3, sticky="w", pady=(9, 4))
@@ -7735,7 +7806,7 @@ class HDXFViewerApp:
         ).pack(side="left", padx=(18, 0))
         if kind in ("subtract", "pixelop"):
             ttk.Checkbutton(
-                flags, text="Verify every output frame", variable=self.processing_verify_var,
+                flags, text="Verify output HDF5 tree" if family == "hdf5" else "Verify every output frame", variable=self.processing_verify_var,
                 style="Modern.TCheckbutton",
             ).pack(side="left", padx=(18, 0))
 
@@ -7785,7 +7856,7 @@ class HDXFViewerApp:
         self.processing_log_text.insert("end", f"Processing script: {script}\n")
         self.processing_log_text.configure(state="disabled")
 
-        active = self._active_hdxf_path()
+        active = self._active_hdf5_path() if family == "hdf5" else self._active_hdxf_path()
         if active is not None:
             self.processing_input_var.set(str(active))
             self._processing_set_default_output(force=True)
@@ -7802,6 +7873,26 @@ class HDXFViewerApp:
         if not input_text:
             return
         source = Path(input_text)
+        if self._processing_family == "hdf5":
+            operation = self.processing_operation_var.get() if self._processing_kind == "sum" else self._processing_kind
+            tag = {
+                "sum": "SUM", "mean": "MEAN", "exposure-normalized": "RATE",
+                "subtract": "FILTERED", "pixelop": "PIXEL_OP",
+            }.get(operation, "PROCESSED")
+            selection = "ALL"
+            selected = self.processing_select_var.get().strip() if hasattr(self, "processing_select_var") else ""
+            start = self.processing_frame_from_var.get().strip() if hasattr(self, "processing_frame_from_var") else ""
+            end = self.processing_frame_to_var.get().strip() if hasattr(self, "processing_frame_to_var") else ""
+            if selected:
+                selection = "SEL"
+            elif start or end:
+                selection = f"{start or '1'}-{end or 'end'}"
+            stem = source.stem[:-7] if source.stem.lower().endswith("_master") else source.stem
+            self.processing_output_var.set(
+                str(source.parent / "hdf5-output" / f"{stem}_{tag}_{selection}_master.h5")
+            )
+            self._processing_output_auto = True
+            return
         if self._processing_kind == "sum":
             operation = self.processing_operation_var.get() if hasattr(self, "processing_operation_var") else "mean"
             tag = {"sum": "SUM", "mean": "MEAN", "exposure-normalized": "RATE"}.get(operation, "SUM")
@@ -7839,10 +7930,27 @@ class HDXFViewerApp:
         for widget in (self.processing_remove_low_entry, self.processing_remove_high_entry):
             widget.configure(state="normal" if range_enabled else "disabled")
 
+    def _processing_use_current_roi(self) -> None:
+        view = self.active_view
+        if view is None:
+            messagebox.showinfo("No active view", "Open an image and draw an ROI first.", parent=self.root)
+            return
+        roi = view.canvas.get_roi()
+        if roi is None:
+            messagebox.showinfo("No ROI", "Draw an ROI in the active view first.", parent=self.root)
+            return
+        x, y, width, height = (int(value) for value in roi)
+        text = f"{x},{y},{x + width - 1},{y + height - 1}"
+        if self._processing_kind == "subtract":
+            self.processing_protect_var.set(text)
+        else:
+            self.processing_pixelop_roi_var.set(text)
+
     def _browse_processing_input(self) -> None:
+        is_hdf5 = self._processing_family == "hdf5"
         filename = filedialog.askopenfilename(
-            parent=self.root, title="Select input HDXF",
-            filetypes=[("HDXF detector archive", "*.hdxf"), ("All files", "*.*")],
+            parent=self.root, title="Select input HDF5" if is_hdf5 else "Select input HDXF",
+            filetypes=[("HDF5 detector file", "*.h5 *.hdf5 *.nxs") if is_hdf5 else ("HDXF detector archive", "*.hdxf"), ("All files", "*.*")],
         )
         if filename:
             self.processing_input_var.set(str(Path(filename)))
@@ -7850,6 +7958,21 @@ class HDXFViewerApp:
             self._processing_set_default_output(force=True)
 
     def _browse_processing_output(self) -> None:
+        if self._processing_family == "hdf5":
+            current = self.processing_output_var.get().strip()
+            initial = Path(current) if current else None
+            filename = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save processed HDF5 master",
+                defaultextension=".h5",
+                initialdir=str(initial.parent) if initial is not None else None,
+                initialfile=initial.name if initial is not None else None,
+                filetypes=[("HDF5 detector file", "*.h5"), ("HDF5 file", "*.hdf5"), ("All files", "*.*")],
+            )
+            if filename:
+                self.processing_output_var.set(str(Path(filename)))
+                self._processing_output_auto = False
+            return
         if self._processing_kind == "sum":
             current = self.processing_output_var.get().strip()
             initial = Path(current) if current else None
@@ -7874,9 +7997,10 @@ class HDXFViewerApp:
                 self._processing_output_auto = False
 
     def _browse_processing_background(self) -> None:
+        is_hdf5 = self._processing_family == "hdf5"
         filename = filedialog.askopenfilename(
-            parent=self.root, title="Select background HDXF",
-            filetypes=[("HDXF detector archive", "*.hdxf"), ("All files", "*.*")],
+            parent=self.root, title="Select background HDF5" if is_hdf5 else "Select background HDXF",
+            filetypes=[("HDF5 detector file", "*.h5 *.hdf5 *.nxs") if is_hdf5 else ("HDXF detector archive", "*.hdxf"), ("All files", "*.*")],
         )
         if filename:
             self.processing_background_var.set(str(Path(filename)))
@@ -7928,20 +8052,87 @@ class HDXFViewerApp:
     def _build_processing_command(self, *, validate: bool = True) -> list[str]:
         kind = self._processing_kind or "sum"
         script = self._processing_script_path(kind)
+        family = self._processing_family
         input_text = self.processing_input_var.get().strip()
         output_text = self.processing_output_var.get().strip()
         if validate:
             if not script.is_file():
                 raise HDXFViewerError(f"processing script not found: {script}")
             if not input_text:
-                raise HDXFViewerError("select an input HDXF archive")
+                raise HDXFViewerError(f"select an input {family.upper()} archive")
             input_path = Path(input_text)
             if not input_path.is_file():
-                raise HDXFViewerError(f"input HDXF does not exist: {input_path}")
-            if input_path.suffix.lower() != ".hdxf":
+                raise HDXFViewerError(f"input {family.upper()} does not exist: {input_path}")
+            if family == "hdxf" and input_path.suffix.lower() != ".hdxf":
                 raise HDXFViewerError("input must be an .hdxf archive")
+            if family == "hdf5" and input_path.suffix.lower() not in (".h5", ".hdf5", ".nxs"):
+                raise HDXFViewerError("input must be an HDF5 .h5/.hdf5/.nxs file")
             if not output_text:
                 raise HDXFViewerError("select an output path")
+
+        if family == "hdf5":
+            output_path = Path(output_text)
+            if output_path.suffix.lower() not in (".h5", ".hdf5", ".nxs"):
+                raise HDXFViewerError("output master must be an HDF5 .h5/.hdf5/.nxs file")
+            if input_text and output_path.resolve() == Path(input_text).resolve():
+                raise HDXFViewerError("input and output HDF5 paths must be different")
+            if Path(input_text).parent.resolve() == output_path.parent.resolve():
+                raise HDXFViewerError(
+                    "choose an output folder different from the input bundle folder; "
+                    "the external-data filenames are preserved inside the copied bundle"
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            mode = self.processing_operation_var.get() if kind == "sum" else ("filter" if kind == "subtract" else "pixelop")
+            cmd = [sys.executable, "-u", str(script), "-i", input_text, "-o", output_text, "--mode", mode]
+            self._append_processing_selection(cmd)
+            if kind == "sum":
+                cmd.extend(["--out-dtype", self.processing_dtype_var.get()])
+            elif kind == "subtract":
+                selected_mode = self.processing_mode_var.get()
+                if selected_mode == "Lower threshold":
+                    value = self._processing_optional_float(self.processing_threshold_var.get(), "Lower threshold")
+                    if value is None:
+                        raise HDXFViewerError("enter a lower threshold")
+                    cmd.extend(["--lower-threshold", value])
+                elif selected_mode == "Background subtraction":
+                    background = self.processing_background_var.get().strip()
+                    if not background:
+                        raise HDXFViewerError("select a background HDF5 file")
+                    if not Path(background).is_file():
+                        raise HDXFViewerError(f"background HDF5 does not exist: {background}")
+                    frame = self._processing_optional_int(self.processing_background_frame_var.get(), "Background frame") or "1"
+                    cmd.extend(["--background", background, "--background-frame", frame])
+                elif selected_mode == "Remove inclusive range":
+                    low = self._processing_optional_float(self.processing_remove_low_var.get(), "Remove range low")
+                    high = self._processing_optional_float(self.processing_remove_high_var.get(), "Remove range high")
+                    if low is None or high is None or float(low) > float(high):
+                        raise HDXFViewerError("enter a valid Remove range low/high pair")
+                    cmd.extend(["--remove-low", low, "--remove-high", high])
+                upper = self._processing_optional_float(self.processing_upper_var.get(), "Upper threshold")
+                if upper is not None:
+                    cmd.extend(["--upper-threshold", upper])
+                fill = self._processing_optional_float(self.processing_fill_var.get(), "Fill value") or "0"
+                cmd.extend(["--fill", fill])
+                protect = self.processing_protect_var.get().strip()
+                if protect:
+                    cmd.extend(["--protect", protect])
+            else:
+                operation = self.processing_pixelop_operation_var.get().lower()
+                value = self._processing_optional_float(self.processing_pixelop_value_var.get(), "Pixel Op value")
+                if value is None:
+                    raise HDXFViewerError("enter a Pixel Op value")
+                if operation == "divide" and float(value) == 0:
+                    raise HDXFViewerError("Pixel Op divide value must be non-zero")
+                cmd.extend(["--pixel-operation", operation, "--value", value])
+                roi = self.processing_pixelop_roi_var.get().strip()
+                if roi:
+                    cmd.extend(["--roi", roi])
+            if self.processing_overwrite_var.get():
+                cmd.append("--overwrite")
+            if self.processing_verify_var.get() or kind == "sum":
+                cmd.append("--verify")
+            self._processing_output_path = output_path
+            return cmd
 
         cmd = [sys.executable, "-u", str(script), "-i", input_text, "-o", output_text]
         self._append_processing_selection(cmd)
@@ -8112,6 +8303,17 @@ class HDXFViewerApp:
         if not line:
             return
 
+        hdf5_output_match = re.match(
+            r"\[OUT HDF5\]\s+(.+\.(?:h5|hdf5|nxs))\s*$", line, flags=re.IGNORECASE
+        )
+        if hdf5_output_match:
+            raw = hdf5_output_match.group(1).strip().strip('"')
+            self._processing_output_path = Path(raw)
+            self.processing_stage_var.set("Finalising HDF5 bundle")
+            self.processing_activity_var.set(f"Output master written: {raw}")
+            self._set_processing_progress(100.0, text="100%")
+            return
+
         final_output_match = re.match(
             r"\[OUT HDXF\]\s+(.+\.hdxf)\s*$", line, flags=re.IGNORECASE
         )
@@ -8222,7 +8424,7 @@ class HDXFViewerApp:
         self.processing_progress_var.set(0.0)
         self.processing_progress_text_var.set("0%")
         self.processing_stage_var.set("Starting processing")
-        self.processing_activity_var.set("Launching the external HDXF processing script.")
+        self.processing_activity_var.set(f"Launching the external {self._processing_family.upper()} processing script.")
         self.processing_status_var.set("Starting…")
         self.processing_elapsed_var.set("Elapsed  0 s")
         self.processing_work_var.set("Frames  —")
@@ -8273,7 +8475,7 @@ class HDXFViewerApp:
             "subtract": "Subtract / Filter",
             "pixelop": "Pixel Operation",
         }.get(self._processing_kind, "Processing")
-        self.status_var.set(f"HDXF {label} running · PID {process.pid}")
+        self.status_var.set(f"{self._processing_family.upper()} {label} running · PID {process.pid}")
 
         def reader() -> None:
             try:
@@ -8338,9 +8540,13 @@ class HDXFViewerApp:
         if return_code == 0:
             self._set_processing_progress(100.0, text="100%")
             self.processing_stage_var.set("Processing complete")
-            self.processing_activity_var.set("The derived HDXF archive was created successfully.")
+            self.processing_activity_var.set(
+                "The processed HDF5 master/data bundle was created successfully."
+                if self._processing_family == "hdf5"
+                else "The derived HDXF archive was created successfully."
+            )
             self.processing_status_var.set("Completed")
-            self.status_var.set("HDXF processing completed")
+            self.status_var.set(f"{self._processing_family.upper()} processing completed")
             output = self._processing_output_path
             if self.processing_open_after_var.get() and output is not None and output.is_file():
                 self.open_path(output)
@@ -8348,7 +8554,7 @@ class HDXFViewerApp:
             self.processing_stage_var.set("Processing failed")
             self.processing_activity_var.set("The processing script exited with an error. Review the log below.")
             self.processing_status_var.set(f"Failed ({return_code})")
-            self.status_var.set(f"HDXF processing failed · exit code {return_code}")
+            self.status_var.set(f"{self._processing_family.upper()} processing failed · exit code {return_code}")
 
     def _stop_processing_process(self) -> None:
         process = self._processing_process
@@ -8387,6 +8593,7 @@ class HDXFViewerApp:
         panel = self._processing_panel
         self._processing_panel = None
         self._processing_kind = None
+        self._processing_family = "hdxf"
         if panel is not None:
             try:
                 if panel.winfo_exists():
@@ -9294,7 +9501,7 @@ class HDXFViewerApp:
         suffix = ""
         if view is not None:
             suffix = f" — {view.label()}"
-        self.root.title(f"HDXF Viewer 0.5.2.0 · HDF5 · ROI DEEPER BLUE SHADE · MOVE + RESIZE{suffix}")
+        self.root.title(f"HDXF Viewer 0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE{suffix}")
 
     def _drop_target_widgets(self) -> tuple[tk.Misc, ...]:
         targets: list[tk.Misc] = []
