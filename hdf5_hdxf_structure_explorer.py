@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import zipfile
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +116,21 @@ class HDF5FolderExplorer(QMainWindow):
         self.path_occurrences: Dict[str, list[Occurrence]] = defaultdict(list)
         self.path_kinds: Dict[str, str] = {}
 
+        # Per merged HDF5 path duplicate analysis.
+        # Value example:
+        # {
+        #   "status": "identical" | "partial" | "different" | "skipped" | "n/a",
+        #   "largest_group": 60,
+        #   "total": 60,
+        #   "groups": {digest: [file1, file2, ...]},
+        #   "reason": ""
+        # }
+        self.path_duplicate_stats: Dict[str, dict[str, Any]] = {}
+        # Avoid reading/decompressing very large detector arrays just to populate
+        # the tree. Small metadata / auxiliary datasets are enough to expose the
+        # 60-copy duplication pattern.
+        self.duplicate_scan_max_logical_bytes = 32 * 1024 * 1024
+
         # Optional HDXF archive opened alongside the HDF5 experiment.
         self.hdxf_path: Optional[str] = None
         self.hdxf_zip: Optional[zipfile.ZipFile] = None
@@ -216,8 +232,8 @@ class HDF5FolderExplorer(QMainWindow):
         hdf5_layout.addLayout(hdf5_top)
 
         self.hdf5_tree = QTreeWidget()
-        self.hdf5_tree.setHeaderLabels(["Object", "Type", "Present", "Shape / Target"])
-        self._configure_interactive_header(self.hdf5_tree, [360, 140, 95, 280])
+        self.hdf5_tree.setHeaderLabels(["Object", "Type", "Present", "Identical", "Shape / Target"])
+        self._configure_interactive_header(self.hdf5_tree, [340, 130, 90, 100, 260])
         self.hdf5_tree.itemSelectionChanged.connect(
             lambda: self.selection_changed(self.hdf5_tree)
         )
@@ -571,6 +587,7 @@ class HDF5FolderExplorer(QMainWindow):
 
     def scan_all_files(self):
         self.path_occurrences.clear()
+        self.path_duplicate_stats.clear()
 
         for file_path, f in self.files.items():
             # Root group
@@ -583,6 +600,195 @@ class HDF5FolderExplorer(QMainWindow):
             )
 
             self._scan_group(file_path, f["/"], "/")
+
+        self._analyze_duplicate_datasets()
+
+    def _attribute_digest(self, obj) -> bytes:
+        h = hashlib.sha256()
+        try:
+            for name in sorted(obj.attrs.keys()):
+                h.update(str(name).encode("utf-8", errors="replace"))
+                try:
+                    value = obj.attrs[name]
+                    arr = np.asarray(value)
+                    h.update(str(arr.dtype).encode("ascii", errors="replace"))
+                    h.update(repr(arr.shape).encode("ascii", errors="replace"))
+                    if arr.dtype.kind in {"O", "U"}:
+                        h.update(repr(value).encode("utf-8", errors="replace"))
+                    else:
+                        h.update(np.ascontiguousarray(arr).tobytes())
+                except Exception as exc:
+                    h.update(f"<attr-read-error:{type(exc).__name__}:{exc}>".encode("utf-8", errors="replace"))
+        except Exception as exc:
+            h.update(f"<attrs-error:{type(exc).__name__}:{exc}>".encode("utf-8", errors="replace"))
+        return h.digest()
+
+    def _safe_dataset_digest(self, file_path: str, path: str) -> tuple[Optional[str], str]:
+        """Return a strict comparison digest without decoding filtered detector data.
+
+        Filtered datasets are hashed from their raw HDF5 chunks via read_direct_chunk().
+        Unfiltered small datasets are hashed from logical values.
+
+        The digest also includes shape, dtype, filter definition and attributes.
+        """
+        f = self.files.get(file_path)
+        if f is None:
+            return None, "file not open"
+
+        try:
+            ds = f[path]
+        except Exception as exc:
+            return None, f"open failed: {exc}"
+
+        if not isinstance(ds, h5py.Dataset):
+            return None, "not a dataset"
+
+        try:
+            logical = int(ds.size) * int(ds.dtype.itemsize)
+        except Exception:
+            logical = None
+
+        # Large image/frame datasets are deliberately excluded from automatic
+        # duplicate analysis to keep opening a 60-file experiment responsive.
+        if logical is not None and logical > self.duplicate_scan_max_logical_bytes:
+            return None, f"skipped: logical size {human_bytes(logical)} > {human_bytes(self.duplicate_scan_max_logical_bytes)}"
+
+        h = hashlib.sha256()
+        h.update(repr(tuple(ds.shape)).encode("ascii", errors="replace"))
+        h.update(str(ds.dtype).encode("ascii", errors="replace"))
+        h.update(self._attribute_digest(ds))
+
+        filters = filter_pipeline(ds)
+        h.update(repr(filters).encode("utf-8", errors="replace"))
+        h.update(repr(ds.chunks).encode("ascii", errors="replace"))
+
+        try:
+            if filters:
+                # Never use ds[...] for filtered datasets here. This follows the
+                # same safety principle as the converter analysis code.
+                if ds.shape == ():
+                    return None, "filtered scalar raw-chunk hashing unsupported"
+
+                if ds.chunks is None:
+                    return None, "filtered dataset is not chunked"
+
+                for sl in ds.iter_chunks():
+                    offset = tuple(int(s.start or 0) for s in sl)
+                    try:
+                        filter_mask, raw = ds.id.read_direct_chunk(offset)
+                    except Exception as exc:
+                        return None, f"raw chunk read failed at {offset}: {exc}"
+                    h.update(repr(offset).encode("ascii", errors="replace"))
+                    h.update(int(filter_mask).to_bytes(8, "little", signed=False))
+                    h.update(raw)
+            else:
+                # Only small unfiltered datasets reach this branch.
+                if ds.shape == ():
+                    value = ds[()]
+                    arr = np.asarray(value)
+                    if arr.dtype.kind in {"O", "U"}:
+                        h.update(repr(value).encode("utf-8", errors="replace"))
+                    else:
+                        h.update(np.ascontiguousarray(arr).tobytes())
+                elif ds.size == 0:
+                    h.update(b"<empty>")
+                else:
+                    # Read in small slabs instead of one giant ds[...].
+                    if len(ds.shape) == 0:
+                        arr = np.asarray(ds[()])
+                        h.update(np.ascontiguousarray(arr).tobytes())
+                    else:
+                        row_bytes = max(1, int(np.prod(ds.shape[1:])) * int(ds.dtype.itemsize))
+                        rows_per = max(1, min(int(ds.shape[0]), (4 * 1024 * 1024) // row_bytes))
+                        start = 0
+                        while start < int(ds.shape[0]):
+                            stop = min(int(ds.shape[0]), start + rows_per)
+                            sl = (slice(start, stop),) + tuple(slice(None) for _ in ds.shape[1:])
+                            arr = np.asarray(ds[sl])
+                            if arr.dtype.kind in {"O", "U"}:
+                                h.update(repr(arr.tolist()).encode("utf-8", errors="replace"))
+                            else:
+                                h.update(np.ascontiguousarray(arr).tobytes())
+                            start = stop
+
+            return h.hexdigest(), ""
+        except Exception as exc:
+            return None, f"digest failed: {type(exc).__name__}: {exc}"
+
+    def _analyze_duplicate_datasets(self):
+        self.path_duplicate_stats.clear()
+
+        for path, occs in self.path_occurrences.items():
+            dataset_occs = [o for o in occs if o.kind == "dataset"]
+
+            if len(dataset_occs) < 2:
+                self.path_duplicate_stats[path] = {
+                    "status": "n/a",
+                    "largest_group": len(dataset_occs),
+                    "total": len(dataset_occs),
+                    "groups": {},
+                    "reason": "",
+                }
+                continue
+
+            groups: Dict[str, list[str]] = defaultdict(list)
+            skipped = []
+            for occ in dataset_occs:
+                digest, reason = self._safe_dataset_digest(occ.file_path, path)
+                if digest is None:
+                    skipped.append((occ.file_path, reason))
+                else:
+                    groups[digest].append(occ.file_path)
+
+            if not groups:
+                status = "skipped"
+                largest = 0
+            else:
+                largest = max(len(v) for v in groups.values())
+                if skipped:
+                    status = "partial"
+                elif largest == len(dataset_occs) and len(groups) == 1:
+                    status = "identical"
+                elif largest > 1:
+                    status = "partial"
+                else:
+                    status = "different"
+
+            reason = "; ".join(
+                f"{Path(f).name}: {r}" for f, r in skipped[:3]
+            )
+            if len(skipped) > 3:
+                reason += f"; ... {len(skipped) - 3} more skipped"
+
+            self.path_duplicate_stats[path] = {
+                "status": status,
+                "largest_group": largest,
+                "total": len(dataset_occs),
+                "groups": dict(groups),
+                "reason": reason,
+                "skipped": skipped,
+            }
+
+    def _duplicate_label(self, path: str, kind: str) -> str:
+        if kind != "dataset":
+            return "-"
+        stat = self.path_duplicate_stats.get(path)
+        if not stat:
+            return "?"
+        status = stat.get("status")
+        largest = int(stat.get("largest_group", 0))
+        total = int(stat.get("total", 0))
+        if total < 2:
+            return "-"
+        if status == "identical":
+            return f"{largest}/{total}"
+        if status == "partial":
+            return f"{largest}/{total}" if largest else "partial"
+        if status == "different":
+            return "0/" + str(total)
+        if status == "skipped":
+            return "skipped"
+        return "-"
 
     def _scan_group(self, file_path: str, group: h5py.Group, group_path: str):
         try:
@@ -678,6 +884,7 @@ class HDF5FolderExplorer(QMainWindow):
                     Path(self.folder_path).name,
                     "HDF5 experiment",
                     f"{len(self.files)} files",
+                    "",
                     human_bytes(sum(os.path.getsize(p) for p in self.files)),
                 ]
             )
@@ -685,13 +892,13 @@ class HDF5FolderExplorer(QMainWindow):
             self.hdf5_tree.addTopLevelItem(root)
 
             logical = QTreeWidgetItem(
-                ["Merged Logical View", "Merged HDF5", f"{len(self.files)} files", ""]
+                ["Merged Logical View", "Merged HDF5", f"{len(self.files)} files", "", ""]
             )
             logical.setData(0, ROLE_MODE, "merged_root")
             root.addChild(logical)
 
             physical = QTreeWidgetItem(
-                ["Physical Files", "HDF5 files", f"{len(self.files)} files", ""]
+                ["Physical Files", "HDF5 files", f"{len(self.files)} files", "", ""]
             )
             physical.setData(0, ROLE_MODE, "physical_root")
             root.addChild(physical)
@@ -738,7 +945,25 @@ class HDF5FolderExplorer(QMainWindow):
                 targets = sorted(set(str(o.target) for o in occs))
                 shape_target = targets[0] if len(targets) == 1 else f"{len(targets)} targets"
 
-            item = QTreeWidgetItem([leaf, kind, present, shape_target])
+            identical = self._duplicate_label(path, kind)
+            item = QTreeWidgetItem([leaf, kind, present, identical, shape_target])
+            if kind == "dataset":
+                stat = self.path_duplicate_stats.get(path, {})
+                status = stat.get("status")
+                if status == "identical" and int(stat.get("total", 0)) > 1:
+                    item.setToolTip(
+                        3,
+                        f"Strictly identical dataset in {stat.get('largest_group', 0)}/{stat.get('total', 0)} occurrences. "
+                        "Comparison includes path-local shape, dtype, attributes and content digest."
+                    )
+                elif status == "partial":
+                    item.setToolTip(
+                        3,
+                        f"Largest identical-content group: {stat.get('largest_group', 0)}/{stat.get('total', 0)}. "
+                        + (stat.get("reason") or "")
+                    )
+                elif status == "skipped":
+                    item.setToolTip(3, stat.get("reason") or "Automatic duplicate scan skipped.")
             item.setData(0, ROLE_MODE, "merged")
             item.setData(0, ROLE_PATH, path)
             item.setData(0, ROLE_KIND, kind)
@@ -761,6 +986,7 @@ class HDF5FolderExplorer(QMainWindow):
                 [
                     label,
                     ftype,
+                    "",
                     "",
                     human_bytes(os.path.getsize(file_path)),
                 ]
@@ -787,12 +1013,12 @@ class HDF5FolderExplorer(QMainWindow):
                 try:
                     link = group.get(name, getlink=True)
                 except Exception as exc:
-                    parent.addChild(QTreeWidgetItem([name, "Error", "", str(exc)]))
+                    parent.addChild(QTreeWidgetItem([name, "Error", "", "", str(exc)]))
                     continue
 
                 if isinstance(link, h5py.ExternalLink):
                     target = f"{link.filename} :: {link.path}"
-                    item = QTreeWidgetItem([name, "External Link", "", target])
+                    item = QTreeWidgetItem([name, "External Link", "", "", target])
                     item.setData(0, ROLE_MODE, "physical")
                     item.setData(0, ROLE_FILE, file_path)
                     item.setData(0, ROLE_PATH, path)
@@ -802,7 +1028,7 @@ class HDF5FolderExplorer(QMainWindow):
                     continue
 
                 if isinstance(link, h5py.SoftLink):
-                    item = QTreeWidgetItem([name, "Soft Link", "", link.path])
+                    item = QTreeWidgetItem([name, "Soft Link", "", "", link.path])
                     item.setData(0, ROLE_MODE, "physical")
                     item.setData(0, ROLE_FILE, file_path)
                     item.setData(0, ROLE_PATH, path)
@@ -814,11 +1040,11 @@ class HDF5FolderExplorer(QMainWindow):
                 try:
                     obj = group[name]
                 except Exception as exc:
-                    parent.addChild(QTreeWidgetItem([name, "Unreadable", "", str(exc)]))
+                    parent.addChild(QTreeWidgetItem([name, "Unreadable", "", "", str(exc)]))
                     continue
 
                 if isinstance(obj, h5py.Group):
-                    item = QTreeWidgetItem([name, "Group", "", ""])
+                    item = QTreeWidgetItem([name, "Group", "", "", ""])
                     item.setData(0, ROLE_MODE, "physical")
                     item.setData(0, ROLE_FILE, file_path)
                     item.setData(0, ROLE_PATH, path)
@@ -828,7 +1054,7 @@ class HDF5FolderExplorer(QMainWindow):
 
                 elif isinstance(obj, h5py.Dataset):
                     shape = "scalar" if obj.shape == () else str(tuple(obj.shape))
-                    item = QTreeWidgetItem([name, "Dataset", "", shape])
+                    item = QTreeWidgetItem([name, "Dataset", "", "", shape])
                     item.setData(0, ROLE_MODE, "physical")
                     item.setData(0, ROLE_FILE, file_path)
                     item.setData(0, ROLE_PATH, path)
@@ -1763,9 +1989,27 @@ class HDF5FolderExplorer(QMainWindow):
         total_logical = sum(o.logical_bytes or 0 for o in occs)
         total_storage = sum(o.storage_bytes or 0 for o in occs)
 
+        dup = self.path_duplicate_stats.get(path, {})
+        dup_status = dup.get("status", "n/a")
+        dup_total = int(dup.get("total", 0))
+        dup_largest = int(dup.get("largest_group", 0))
+        if dup_total >= 2:
+            if dup_status == "identical":
+                dup_text = f"{dup_largest}/{dup_total} strictly identical"
+            elif dup_status == "partial":
+                dup_text = f"largest identical group {dup_largest}/{dup_total}"
+            elif dup_status == "different":
+                dup_text = f"no duplicate group across {dup_total} datasets"
+            else:
+                dup_text = dup_status
+        else:
+            dup_text = "-"
+
         rows = [
             ("Merged path", path),
             ("Present in files", f"{len(occs)} / {len(self.files)}"),
+            ("Strict duplicate status", dup_text),
+            ("Duplicate scan note", dup.get("reason") or "-"),
             ("Kinds", ", ".join(kinds)),
             ("Unique shapes", ", ".join(shapes) if shapes else "-"),
             ("Unique dtypes", ", ".join(dtypes) if dtypes else "-"),
@@ -2146,6 +2390,7 @@ class HDF5FolderExplorer(QMainWindow):
                 or needle in item.text(1).lower()
                 or needle in item.text(2).lower()
                 or needle in item.text(3).lower()
+                or needle in item.text(4).lower()
                 or needle in str(item.data(0, ROLE_PATH) or "").lower()
             )
 
@@ -2246,13 +2491,32 @@ class HDF5FolderExplorer(QMainWindow):
                 )
             )
 
+        duplicate_paths = []
+        for p in sorted(dataset_paths):
+            st = self.path_duplicate_stats.get(p, {})
+            total = int(st.get("total", 0))
+            largest = int(st.get("largest_group", 0))
+            if total >= 2 and largest > 1:
+                duplicate_paths.append((p, largest, total, st.get("status", "")))
+
         lines = [
             f"Folder: {self.folder_path}",
             f"Physical HDF5 files: {len(self.files)}",
             f"Master: {Path(self.master_file).name if self.master_file else '-'}",
             f"Unique merged dataset paths: {len(dataset_paths)}",
             "",
+            "[STRICT DUPLICATE DATASETS]",
+            "The Identical column in Merged Logical View shows the largest strict identical group.",
+            "Example: 60/60 = all 60 physical occurrences have the same shape, dtype, attributes and content digest.",
         ]
+
+        if duplicate_paths:
+            for p, largest, total, status in duplicate_paths:
+                lines.append(f"  {largest}/{total}  {p}")
+        else:
+            lines.append("  No duplicate groups found among automatically scanned datasets.")
+
+        lines.append("")
 
         for cat, items in groups.items():
             if not items:
