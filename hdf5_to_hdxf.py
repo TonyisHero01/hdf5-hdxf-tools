@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Convert HDF5 detector data to HDXF.
 
-Tool v0.4.6 adds exact legacy-HDF5 reconstruction descriptors and archives all datasets in followed external HDF5 files.
+Tool v0.4.8 adds exact legacy-HDF5 reconstruction descriptors and archives all datasets in followed external HDF5 files.
 
-For detector archives, the converter validates that ``legacy-template``
-contains a byte-identical copy of the input master HDF5 file.  The HDXF
-manifest records the template identity and the complete local HDF5 structure
-of every followed external data file (Groups, Datasets, attributes, links and
-Dataset creation/storage properties).  This allows HDXF -> HDF5 restoration
-to copy the original master template instead of rebuilding it heuristically,
-then reconstruct the externally linked data files with their original HDF5
-layout.
+For detector archives, the input master HDF5 file itself is used as the exact
+master-template identity.  The converter no longer reads or validates a copy
+from ``legacy_template`` / ``legacy-template``.  The input master itself is stored once inside HDXF; the manifest records the
+input master's identity and the complete local HDF5 structure of every followed
+external data file (Groups, Datasets, attributes, links and Dataset
+creation/storage properties).  This keeps exact-reconstruction metadata tied
+directly to the source master while preserving the existing manifest schema.
 
 Scientific metadata and detector pixels continue to be stored losslessly.
 Conversion-host details are not added to the source metadata.
@@ -37,6 +36,11 @@ import uuid
 import warnings
 import zipfile
 from contextlib import contextmanager
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from hdxf_hardware import (MemoryGuard, snapshot as hardware_snapshot, recommend_encoder,
+                           gpu_pool_limit_mib, gpu_temperature)
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -70,6 +74,8 @@ except ImportError:
 # Keeping it optional preserves the normal CPU-only installation.
 _CUPY: Any | None = None
 _CUPY_IMPORT_ERROR: BaseException | None = None
+# Serialize GPU allocations; independent CPU compression jobs may overlap.
+_CUDA_DELTA_LOCK = threading.Lock()
 
 FORMAT_NAME = "HDF5-derived Detector eXchange Format"
 FORMAT_ID = "hdxf"
@@ -78,29 +84,11 @@ TOOL_VERSION = "0.4.8"
 LEGACY_RECONSTRUCTION_VERSION = "1.1"
 
 
-def _default_legacy_template_dir() -> Path:
-    """Resolve the conventional legacy-template directory robustly.
-
-    Existing project trees have used both ``legacy_template`` and
-    ``legacy-template``.  Prefer an existing directory instead of forcing one
-    spelling.  If neither exists yet, default to ``legacy_template`` because
-    that is the current project layout.
-    """
-    base = Path(__file__).resolve().parent
-    candidates = (
-        base / "legacy_template",
-        base / "legacy-template",
-    )
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return candidates[0]
-
-
-DEFAULT_LEGACY_TEMPLATE_DIR = _default_legacy_template_dir()
 HDXFB_MAGIC = b"HDXFB\x00\x01"
 CALIBRATION_ROOT = "/entry/instrument/detector/calibration"
 MANIFEST_PATH = "manifest.json"
+EMBEDDED_MASTER_PATH = "reconstruction/master.h5"
+SELECTIVE_ZIP_DEFLATE_LEVEL = 6
 CALIBRATION_INDEX_NAME = "calibration_index.json"
 CALIBRATION_REPORT_NAME = "calibration_report.csv"
 CALIBRATION_INDEX_VERSION = "2.0"
@@ -157,10 +145,15 @@ def configure_compute_backend(
             name = props.get("name", b"unknown")
             if isinstance(name, bytes):
                 name = name.decode("utf-8", errors="replace")
-            if gpu_memory_limit_mib > 0:
-                cp.get_default_memory_pool().set_limit(
-                    size=int(gpu_memory_limit_mib) * 1024 * 1024
-                )
+            free_initial, total_initial = cp.cuda.runtime.memGetInfo()
+            safe_pool_mib = gpu_pool_limit_mib(
+                free_bytes=free_initial, total_bytes=total_initial,
+                manual_limit_mib=gpu_memory_limit_mib,
+            )
+            if safe_pool_mib == 0:
+                raise ConversionError("Too little free CUDA VRAM for a protected HDXF conversion")
+            # This caps the CuPy pool for THIS process, not total GPU usage.
+            cp.get_default_memory_pool().set_limit(size=safe_pool_mib * 1024 * 1024)
             probe = cp.asarray(np.array([[-32768, 0, 32767], [-32767, 2, 32760]], dtype=np.int16))
             delta = cp.subtract(probe[1:], probe[:-1], dtype=cp.int32)
             result = cp.asnumpy(delta)
@@ -176,12 +169,12 @@ def configure_compute_backend(
             "cupy": str(getattr(cp, "__version__", "unknown")),
             "gpu_total_bytes": int(total_bytes),
             "gpu_free_bytes_at_start": int(free_bytes),
-            "gpu_memory_limit_mib": int(gpu_memory_limit_mib),
+            "gpu_memory_limit_mib": int(safe_pool_mib),
         }
     except Exception as exc:
         if requested == "auto":
             print(
-                f"[WARN] CUDA backend unavailable; using CPU vectorized Delta: "
+                f"[WARN] CUDA backend unavailable; using CPU streaming Delta: "
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
                 flush=True,
@@ -1098,7 +1091,7 @@ def _compute_temporal_deltas_cuda(
     """Compute exact temporal Delta and range on a CUDA device using CuPy."""
     cp = _load_cupy()
     compute_dtype = cp.int32 if contiguous.dtype.itemsize <= 2 else cp.int64
-    with cp.cuda.Device(cuda_device):
+    with _CUDA_DELTA_LOCK, cp.cuda.Device(cuda_device):
         stream = cp.cuda.get_current_stream()
         upload_started = time.perf_counter()
         gpu_block = cp.asarray(contiguous)
@@ -1920,6 +1913,8 @@ class HDXFWriter:
         progress_every: int,
         compute_info: dict[str, Any],
         cuda_device: int,
+        encode_workers: int,
+        pipeline_mib: int,
         delta_filter_policy: str,
         gc_every: int,
         keyframe_interval_blocks: int,
@@ -1928,8 +1923,6 @@ class HDXFWriter:
         global_static_scan: str,
         manifest_layout: str,
         frame_index_layout: str,
-        legacy_template_dir: Path | None,
-        require_legacy_template: bool,
         auxiliary_policy: str,
         auxiliary_derive_max_mib: float,
     ) -> None:
@@ -1960,7 +1953,11 @@ class HDXFWriter:
         self.progress_every = max(1, int(progress_every))
         self.compute_info = dict(compute_info)
         self.delta_compute_backend = str(compute_info.get("resolved", "cpu-streaming"))
+        self._cuda_fallback_event = threading.Event()
+        self._gpu_thermal_check_at = 0.0
         self.cuda_device = int(cuda_device)
+        self.encode_workers = max(1, int(encode_workers))
+        self.pipeline_mib = max(128, int(pipeline_mib))
         self.delta_filter_policy = str(delta_filter_policy)
         self.gc_every = max(0, int(gc_every))
         self.keyframe_interval_blocks = max(1, int(keyframe_interval_blocks))
@@ -1969,16 +1966,17 @@ class HDXFWriter:
         self.global_static_scan = str(global_static_scan)
         self.manifest_layout = str(manifest_layout)
         self.frame_index_layout = str(frame_index_layout)
-        self.legacy_template_dir = (
-            legacy_template_dir.resolve()
-            if legacy_template_dir is not None
-            else None
-        )
-        self.require_legacy_template = bool(require_legacy_template)
         self.auxiliary_policy = str(auxiliary_policy)
         self.auxiliary_derive_max_bytes = max(
             0, int(float(auxiliary_derive_max_mib) * 1024 * 1024)
         )
+
+        # Self-contained exact restore: the original master HDF5 bytes are
+        # stored exactly once in the HDXF archive.  Master-local metadata and
+        # dataset values are represented by references to this member instead
+        # of being encoded again as independent HDXF payloads.
+        self._input_master_path: Path | None = None
+        self._embedded_master_member = EMBEDDED_MASTER_PATH
 
         # Exact HDF5 restoration control data.  This is not scientific metadata;
         # it is a reconstruction descriptor consumed by HDXF -> HDF5.
@@ -2068,12 +2066,16 @@ class HDXFWriter:
             "shared_static_models": 0,
             "shared_static_model_payload_bytes": 0,
             "embedded_calibration_payload_bytes": 0,
+            "embedded_master_bytes": 0,
             "unique_payload_bytes": 0,
             "payload_bytes_by_encoding": {},
             "manifest_bytes": 0,
             "frame_index_bytes": 0,
             "archive_file_bytes": 0,
             "container_overhead_bytes": 0,
+            "outer_zip_savings_bytes": 0,
+            "embedded_master_zip_bytes": 0,
+            "manifest_zip_bytes": 0,
             "auxiliary_derived_datasets": 0,
             "auxiliary_derived_logical_bytes": 0,
             "auxiliary_auto_hdxfb_members": 0,
@@ -2096,9 +2098,9 @@ class HDXFWriter:
         _progress(f"starting conversion: {input_path.name}")
         _progress(f"output: {output_path}")
 
-        # Exact reconstruction starts by validating the byte-identical master
-        # template.  This happens before expensive frame encoding so a wrong
-        # template fails immediately.
+        # Exact reconstruction uses one authoritative copy of the input master
+        # embedded inside HDXF. No external legacy-template directory is read.
+        self._input_master_path = input_path
         self._prepare_legacy_reconstruction(input_path)
 
         if self.profile == "detector-frame-archive":
@@ -2128,6 +2130,7 @@ class HDXFWriter:
                 compresslevel=self.zip_compresslevel,
                 allowZip64=True,
             ) as archive:
+                self._write_embedded_master(archive, input_path)
                 _progress("walking HDF5 object tree and encoding datasets")
                 root_id = self._walk_hdf5(h5file, archive, input_path)
 
@@ -2173,7 +2176,12 @@ class HDXFWriter:
                 manifest_indent = 2 if self.manifest_layout == "pretty" else None
                 manifest_bytes = strict_json_dumps(manifest, indent=manifest_indent)
                 self.encoding_stats["manifest_bytes"] = len(manifest_bytes)
-                archive.writestr(MANIFEST_PATH, manifest_bytes)
+                archive.writestr(
+                    MANIFEST_PATH,
+                    manifest_bytes,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                    compresslevel=SELECTIVE_ZIP_DEFLATE_LEVEL,
+                )
 
             # Build/verify the optional calibration bundle before publishing
             # the experiment archive, so conversion remains atomic.
@@ -2191,8 +2199,21 @@ class HDXFWriter:
             os.replace(temp_path, output_path)
             archive_bytes = int(output_path.stat().st_size)
             self.encoding_stats["archive_file_bytes"] = archive_bytes
-            known_member_bytes = int(self.encoding_stats.get("unique_payload_bytes", 0)) + int(self.encoding_stats.get("manifest_bytes", 0))
-            self.encoding_stats["container_overhead_bytes"] = max(0, archive_bytes - known_member_bytes)
+            with zipfile.ZipFile(output_path, "r") as published_archive:
+                infos = published_archive.infolist()
+                zip_uncompressed = sum(int(info.file_size) for info in infos)
+                zip_compressed = sum(int(info.compress_size) for info in infos)
+                info_by_name = {info.filename: info for info in infos}
+                master_info = info_by_name.get(self._embedded_master_member)
+                manifest_info = info_by_name.get(MANIFEST_PATH)
+                if master_info is not None:
+                    self.encoding_stats["embedded_master_zip_bytes"] = int(master_info.compress_size)
+                if manifest_info is not None:
+                    self.encoding_stats["manifest_zip_bytes"] = int(manifest_info.compress_size)
+                self.encoding_stats["outer_zip_savings_bytes"] = max(0, zip_uncompressed - zip_compressed)
+                # ZIP headers/central directory overhead is the archive size minus the
+                # compressed member bytes, not minus their logical/uncompressed sizes.
+                self.encoding_stats["container_overhead_bytes"] = max(0, archive_bytes - zip_compressed)
             _progress(f"published archive: {output_path}")
             _progress(
                 "space breakdown: "
@@ -2200,10 +2221,14 @@ class HDXFWriter:
                 f"frames={int(self.encoding_stats.get('encoded_frame_bytes', 0)) / (1024*1024):.2f} MiB, "
                 f"shared_static={int(self.encoding_stats.get('shared_static_model_payload_bytes', 0)) / (1024*1024):.2f} MiB, "
                 f"embedded_calibration={int(self.encoding_stats.get('embedded_calibration_payload_bytes', 0)) / (1024*1024):.2f} MiB, "
+                f"embedded_master={int(self.encoding_stats.get('embedded_master_bytes', 0)) / (1024*1024):.2f} MiB "
+                f"(zip={int(self.encoding_stats.get('embedded_master_zip_bytes', 0)) / (1024*1024):.2f} MiB), "
                 f"frame_index={int(self.encoding_stats.get('frame_index_bytes', 0)) / (1024*1024):.2f} MiB, "
                 f"aux_derived_logical={int(self.encoding_stats.get('auxiliary_derived_logical_bytes', 0)) / (1024*1024):.2f} MiB, "
                 f"aux_encoded={int(self.encoding_stats.get('auxiliary_auto_encoded_bytes', 0)) / (1024*1024):.2f} MiB, "
-                f"manifest={int(self.encoding_stats.get('manifest_bytes', 0)) / (1024*1024):.2f} MiB, "
+                f"manifest={int(self.encoding_stats.get('manifest_bytes', 0)) / (1024*1024):.2f} MiB "
+                f"(zip={int(self.encoding_stats.get('manifest_zip_bytes', 0)) / (1024*1024):.2f} MiB), "
+                f"outer_zip_savings={int(self.encoding_stats.get('outer_zip_savings_bytes', 0)) / (1024*1024):.2f} MiB, "
                 f"container_overhead={int(self.encoding_stats.get('container_overhead_bytes', 0)) / (1024*1024):.2f} MiB"
             )
             return manifest
@@ -2212,41 +2237,18 @@ class HDXFWriter:
             raise
 
     def _prepare_legacy_reconstruction(self, input_path: Path) -> None:
-        """Validate the original master template and initialise the descriptor."""
-        if self.legacy_template_dir is None:
-            if self.require_legacy_template:
-                raise ConversionError(
-                    "Exact legacy HDF5 restoration requires a legacy-template "
-                    "directory, but no directory was configured."
-                )
-            return
-
-        template_path = self.legacy_template_dir / input_path.name
-        if not template_path.is_file():
-            if self.require_legacy_template:
-                raise ConversionError(
-                    "Exact legacy HDF5 restoration requires the original master "
-                    f"template: {template_path}"
-                )
-            _progress(
-                f"legacy template not found; exact-master restore descriptor "
-                f"disabled: {template_path.name}"
-            )
-            return
-
-        _progress(f"validating legacy master template: {template_path.name}")
-        source_sha = sha256_file(input_path)
+        """Describe the one embedded authoritative master used for restoration."""
+        template_path = input_path.resolve()
+        _progress(
+            f"embedding input master as sole exact HDF5 template: {template_path.name}"
+        )
         template_sha = sha256_file(template_path)
-        if source_sha != template_sha:
-            raise ConversionError(
-                "legacy-template master is not byte-identical to the input "
-                f"master HDF5: {template_path.name}\n"
-                f"input sha256   = {source_sha}\n"
-                f"template sha256= {template_sha}"
-            )
 
         self.legacy_hdf5 = {
             "version": LEGACY_RECONSTRUCTION_VERSION,
+            # Keep the legacy strategy token for compatibility with the existing
+            # exact restorer.  The new member/source fields let a no-template
+            # front-end supply the embedded master automatically.
             "restore_strategy": (
                 "copy-byte-identical-master-template-and-rebuild-external-files"
             ),
@@ -2255,6 +2257,8 @@ class HDXFWriter:
                 "sha256": template_sha,
                 "size_bytes": int(template_path.stat().st_size),
                 "match": "byte-identical-to-input-master",
+                "source": "embedded-hdxf-member",
+                "member": self._embedded_master_member,
             },
             "external_files": [],
             "external_links": self._legacy_external_links,
@@ -2262,6 +2266,41 @@ class HDXFWriter:
                 "all_external_datasets_archived": None,
                 "unarchived_datasets": [],
             },
+        }
+
+    def _write_embedded_master(self, archive: zipfile.ZipFile, input_path: Path) -> None:
+        """Store the original master bytes once, DEFLATE-compressed by the ZIP container.
+
+        ZIP compression is fully reversible, so reading this member yields the exact
+        original master bytes and preserves the recorded SHA256 byte-for-byte.
+        Detector payload members remain ZIP_STORED because they are already compressed.
+        """
+        data = input_path.read_bytes()
+        expected = self.legacy_hdf5.get("master_template", {}) if self.legacy_hdf5 else {}
+        digest = sha256_bytes(data)
+        if expected.get("sha256") and digest != expected["sha256"]:
+            raise ConversionError("input master changed while conversion was starting")
+        archive.writestr(
+            self._embedded_master_member,
+            data,
+            compress_type=zipfile.ZIP_DEFLATED,
+            compresslevel=SELECTIVE_ZIP_DEFLATE_LEVEL,
+        )
+        self.encoding_stats["embedded_master_bytes"] = len(data)
+
+    def _is_input_master_source(self, source_file_path: Path) -> bool:
+        if self._input_master_path is None:
+            return False
+        return (
+            _normalise_source_filename(source_file_path)
+            == _normalise_source_filename(self._input_master_path)
+        )
+
+    def _embedded_master_reference(self, object_path: str) -> dict[str, Any]:
+        return {
+            "kind": "embedded-master-hdf5",
+            "member": self._embedded_master_member,
+            "object_path": str(object_path),
         }
 
     def _capture_legacy_external_file(
@@ -2874,6 +2913,28 @@ class HDXFWriter:
 
         external_files.sort(key=source_sort_key)
         self.legacy_hdf5["external_files"] = external_files
+
+        # Single-source manifest rule: exact external-file structural metadata
+        # lives in legacy_hdf5.external_files.  Archive objects keep only their
+        # payload/index role and point back to that authoritative descriptor,
+        # rather than repeating attributes/storage information.
+        for descriptor in external_files:
+            source_id = str(descriptor.get("source_file", {}).get("source_id") or "")
+            for local_id, record in (descriptor.get("objects") or {}).items():
+                if not isinstance(record, dict):
+                    continue
+                archive_object_id = record.get("archive_object")
+                if not archive_object_id:
+                    continue
+                archive_object = self.objects.get(str(archive_object_id))
+                if not isinstance(archive_object, dict):
+                    continue
+                archive_object.pop("attributes", None)
+                archive_object.pop("hdf5_storage", None)
+                archive_object["reconstruction_ref"] = {
+                    "source_id": source_id,
+                    "local_object": str(local_id),
+                }
         coverage = self.legacy_hdf5["coverage"]
         coverage["unarchived_datasets"] = unarchived
         coverage["all_external_datasets_archived"] = not unarchived
@@ -3546,6 +3607,7 @@ class HDXFWriter:
         if identity is not None:
             self._address_to_id[identity] = object_id
         source_file_value = self._source_id(source_file_path)
+        is_master_source = self._is_input_master_source(source_file_path)
         if isinstance(obj, h5py.Group):
             entry: dict[str, Any] = {
                 "id": object_id,
@@ -3553,9 +3615,14 @@ class HDXFWriter:
                 "source_path": path,
                 "source_local_path": str(obj.name),
                 "source_file": source_file_value,
-                "attributes": encode_attributes(obj.attrs, h5file),
                 "children": [],
             }
+            if is_master_source:
+                # Do not duplicate master attributes in manifest.json.  They are
+                # read from the byte-identical embedded HDF5 member when needed.
+                entry["source_ref"] = self._embedded_master_reference(str(obj.name))
+            else:
+                entry["attributes"] = encode_attributes(obj.attrs, h5file)
             self.objects[object_id] = entry
             self._map_legacy_archive_object(
                 obj, source_file_path, object_id
@@ -3586,6 +3653,33 @@ class HDXFWriter:
                 entry["children"].append({"name": name, "object": child_id})
             return object_id
         if isinstance(obj, h5py.Dataset):
+            if is_master_source:
+                # Storing both the original master bytes and a second encoded
+                # copy of each master-local Dataset would violate the single-
+                # source rule.  Detector frame pixels are expected to live in
+                # external data files for this trial mode.
+                if self._is_frame_dataset(path, obj):
+                    raise ConversionError(
+                        "No-duplicate embedded-master mode requires detector frame "
+                        f"Datasets to be external to the master; found local frame Dataset {path}"
+                    )
+                entry = {
+                    "id": object_id,
+                    "type": "dataset",
+                    "source_path": path,
+                    "source_local_path": str(obj.name),
+                    "source_file": source_file_value,
+                    "source_ref": self._embedded_master_reference(str(obj.name)),
+                    "payload": {
+                        "encoding": "embedded-master-reference",
+                        "state": "present",
+                        "member": self._embedded_master_member,
+                        "object_path": str(obj.name),
+                    },
+                }
+                self.objects[object_id] = entry
+                return object_id
+
             entry = {
                 "id": object_id,
                 "type": "dataset",
@@ -3925,71 +4019,56 @@ class HDXFWriter:
             f"frame dataset {path}: frames={frame_count}, shape={tuple(dataset.shape[1:])}, "
             f"dtype={dataset.dtype}, blocks={total_blocks}, block_frames={self.block_frames}"
         )
-        for block_index, start0 in enumerate(range(0, frame_count, self.block_frames)):
-            stop0 = min(frame_count, start0 + self.block_frames)
-            plan = SlicePlan(
-                selection=(slice(start0, stop0),) + tuple(slice(None) for _ in dataset.shape[1:]),
-                start=[start0] + [0] * (len(dataset.shape) - 1),
-                count=[stop0 - start0] + [int(x) for x in dataset.shape[1:]],
-            )
-            should_report = (
-                block_index == 0
-                or block_index + 1 == total_blocks
-                or (block_index + 1) % self.progress_every == 0
-            )
-            if should_report:
-                _progress(
-                    f"reading frame block {block_index + 1}/{total_blocks}: "
-                    f"local frames {start0}..{stop0 - 1}"
-                )
-            read_started = time.perf_counter()
-            block = self._read_chunk(dataset, plan, source_file_path, block_index)
-            self.encoding_stats["timings"]["read_seconds"] += time.perf_counter() - read_started
-            if should_report:
-                _progress(
-                    f"encoding frame block {block_index + 1}/{total_blocks}: "
-                    f"memory={block.nbytes / (1024 * 1024):.1f} MiB, transform={self.frame_transform}"
-                )
-            if self.delta_filter_policy == "learn":
-                effective_delta_filter = self._delta_filter_cache.get(path, "auto")
-            else:
-                effective_delta_filter = self.delta_filter_policy
+        # Parallelize the expensive CPU codecs while keeping every HDF5 read and
+        # every archive/manifest update on this one thread.  Finished jobs are
+        # committed in frame order so continuation references and binary indices
+        # are fully backward compatible with the original writer.
+        pending = deque()
+        queued_bytes = 0
+        max_queued_bytes = int(self.pipeline_mib) * 1024 * 1024
+        memory_guard = MemoryGuard(max_workers=self.encode_workers, report=_progress)
+        _progress(f"Frame encoder pipeline: up to {self.encode_workers} workers, "
+                  f"{self.pipeline_mib} MiB input budget; RAM admission guard enabled; "
+                  "HDF5/ZIP access serialized")
 
-            # Delta and Auto share the same chain schedule.  At the configured
-            # interval we force the Delta candidate to be an anchor; otherwise
-            # it may continue from the previous logical frame even when the
-            # previous selected Auto block happened to be Raw or Adaptive.
-            #
-            # That is safe because Raw/Adaptive blocks are independently
-            # decodable and therefore themselves act as restart/keyframe
-            # points in the frame index.
-            force_delta_anchor = (
-                self.frame_transform in ("delta", "auto")
-                and (
-                    block_index % self.keyframe_interval_blocks == 0
-                    or previous_frame is None
-                )
-            )
-
-            data, header, candidate_sizes, encode_timings = encode_frame_block_hdxfb(
-                block,
-                transform=self.frame_transform,
-                clevel=self.zstd_level,
-                tile_height=self.tile_height,
-                tile_width=self.tile_width,
+        def encode_job(block, effective_filter, preceding_frame, anchor_reference):
+            arguments = dict(
+                transform=self.frame_transform, clevel=self.zstd_level,
+                tile_height=self.tile_height, tile_width=self.tile_width,
                 sparse_threshold=self.sparse_threshold,
                 enable_jungfrau_split=self.enable_jungfrau_split,
-                delta_compute_backend=self.delta_compute_backend,
-                cuda_device=self.cuda_device,
-                delta_filter=effective_delta_filter,
-                previous_frame=None if force_delta_anchor else previous_frame,
-                static_mask=static_mask,
-                static_reference=static_reference if force_delta_anchor else None,
+                delta_compute_backend=("cpu-streaming" if self._cuda_fallback_event.is_set()
+                                       else self.delta_compute_backend),
+                cuda_device=self.cuda_device, delta_filter=effective_filter,
+                previous_frame=preceding_frame, static_mask=static_mask,
+                static_reference=anchor_reference,
                 shared_static_model_id=shared_static_model_id,
                 delta_stream=self.delta_stream,
                 zero_rle_threshold=self.zero_rle_threshold,
             )
+            try:
+                return encode_frame_block_hdxfb(block, **arguments)
+            except Exception as exc:
+                if (self.compute_info.get("requested") != "auto"
+                        or self.delta_compute_backend != "cuda-cupy"):
+                    raise
+                # A CUDA allocation/kernel may fail after the initial probe.
+                # Re-encode this exact unmodified block on CPU rather than
+                # dropping data or writing a partial archive member.
+                if not self._cuda_fallback_event.is_set():
+                    _progress(f"[WARN] CUDA frame block failed ({type(exc).__name__}: {exc}); "
+                              "switching subsequent blocks to CPU and retrying losslessly")
+                self._cuda_fallback_event.set()
+                arguments["delta_compute_backend"] = "cpu-streaming"
+                return encode_frame_block_hdxfb(block, **arguments)
 
+        def commit_one():
+            nonlocal queued_bytes, current_anchor_global_start
+            (block_index, start0, stop0, plan, block, should_report, future) = pending.popleft()
+            try:
+                data, header, candidate_sizes, encode_timings = future.result()
+            finally:
+                queued_bytes -= block.nbytes
             for timing_name, timing_value in encode_timings.items():
                 if timing_name in self.encoding_stats["timings"]:
                     self.encoding_stats["timings"][timing_name] += float(timing_value)
@@ -4091,10 +4170,108 @@ class HDXFWriter:
             self.frame_archive["blocks"].append({**member, "source_object": object_id})
             if not requires_previous_frame:
                 self.frame_archive["keyframe_index"].append(global_start + start0)
-            previous_frame = np.ascontiguousarray(block[-1])
             del data, header, block
             if self.gc_every and (block_index + 1) % self.gc_every == 0:
                 gc.collect()
+
+        with ThreadPoolExecutor(max_workers=self.encode_workers, thread_name_prefix="hdxf-encode") as executor:
+            for block_index, start0 in enumerate(range(0, frame_count, self.block_frames)):
+                stop0 = min(frame_count, start0 + self.block_frames)
+                plan = SlicePlan(
+                    selection=(slice(start0, stop0),) + tuple(slice(None) for _ in dataset.shape[1:]),
+                    start=[start0] + [0] * (len(dataset.shape) - 1),
+                    count=[stop0 - start0] + [int(x) for x in dataset.shape[1:]],
+                )
+                should_report = (
+                    block_index == 0
+                    or block_index + 1 == total_blocks
+                    or (block_index + 1) % self.progress_every == 0
+                )
+                if should_report:
+                    _progress(
+                        f"reading frame block {block_index + 1}/{total_blocks}: "
+                        f"local frames {start0}..{stop0 - 1}"
+                    )
+                # Admission BEFORE HDF5 read avoids transient memory spikes.
+                estimated_mib = ((stop0 - start0) * int(np.prod(frame_shape, dtype=np.int64))
+                                 * max(1, int(dataset.dtype.itemsize)) / (1024 * 1024))
+                while True:
+                    allowed, runtime_budget_mib, current_ram = memory_guard.assess(estimated_mib)
+                    runtime_budget_bytes = min(max_queued_bytes, runtime_budget_mib * 1024 * 1024)
+                    if pending and (len(pending) >= allowed or
+                                    queued_bytes + estimated_mib * 1024 * 1024 > runtime_budget_bytes):
+                        commit_one()
+                        continue
+                    if not pending and memory_guard.is_critical(current_ram):
+                        _progress("[RAM GUARD] critically low free RAM; waiting before next HDF5 read")
+                        for _ in range(20):
+                            time.sleep(1)
+                            memory_guard._last_check = -1e9
+                            _, _, current_ram = memory_guard.assess(estimated_mib)
+                            if not memory_guard.is_critical(current_ram):
+                                break
+                        if memory_guard.is_critical(current_ram):
+                            raise ConversionError("RAM protection stopped conversion: less than 2% "
+                                                  "system memory available for 20 seconds. Close "
+                                                  "other applications and retry.")
+                    break
+                if (self.delta_compute_backend == "cuda-cupy"
+                        and not self._cuda_fallback_event.is_set()
+                        and time.monotonic() >= self._gpu_thermal_check_at):
+                    self._gpu_thermal_check_at = time.monotonic() + 20.0
+                    temp_c = gpu_temperature(self.cuda_device)
+                    if temp_c is not None and temp_c >= 85:
+                        _progress(f"[GPU GUARD] GPU {temp_c}°C; switching Delta to CPU "
+                                  "for remaining blocks")
+                        self._cuda_fallback_event.set()
+                read_started = time.perf_counter()
+                block = self._read_chunk(dataset, plan, source_file_path, block_index)
+                self.encoding_stats["timings"]["read_seconds"] += time.perf_counter() - read_started
+                if should_report:
+                    _progress(
+                        f"encoding frame block {block_index + 1}/{total_blocks}: "
+                        f"memory={block.nbytes / (1024 * 1024):.1f} MiB, transform={self.frame_transform}"
+                    )
+                if self.delta_filter_policy == "learn":
+                    effective_delta_filter = self._delta_filter_cache.get(path, "auto")
+                else:
+                    effective_delta_filter = self.delta_filter_policy
+
+                # Delta and Auto share the same chain schedule.  At the configured
+                # interval we force the Delta candidate to be an anchor; otherwise
+                # it may continue from the previous logical frame even when the
+                # previous selected Auto block happened to be Raw or Adaptive.
+                #
+                # That is safe because Raw/Adaptive blocks are independently
+                # decodable and therefore themselves act as restart/keyframe
+                # points in the frame index.
+                force_delta_anchor = (
+                    self.frame_transform in ("delta", "auto")
+                    and (
+                        block_index % self.keyframe_interval_blocks == 0
+                        or previous_frame is None
+                    )
+                )
+
+                # Limit resident block inputs. We may always enqueue one oversized
+                # block; it must not cause a deadlock waiting on an empty queue.
+                while pending and (len(pending) >= allowed
+                                   or queued_bytes + block.nbytes > runtime_budget_bytes):
+                    commit_one()
+                frame_before = None if force_delta_anchor else previous_frame
+                anchor_reference = static_reference if force_delta_anchor else None
+                future = executor.submit(encode_job, block, effective_delta_filter,
+                                         frame_before, anchor_reference)
+                pending.append((block_index, start0, stop0, plan, block, should_report, future))
+                queued_bytes += block.nbytes
+                # Set the predecessor from the source pixels, not an encoded block.
+                # This preserves the exact temporal Delta chain across worker jobs.
+                previous_frame = np.array(block[-1], copy=True, order="C")
+                if block_index == 0 and self.delta_filter_policy == "learn":
+                    # Learn the filter before dispatching later blocks of this Dataset.
+                    commit_one()
+        while pending:
+            commit_one()
         frame_index_count = len(self.frame_archive["blocks"]) - frame_index_start
         if self.frame_index_layout == "binary":
             payload_entry["encoding"] = "frame-sequence-indexed"
@@ -4238,6 +4415,865 @@ class HDXFWriter:
             })
         payload_entry["state"] = "present"
 
+# -----------------------------------------------------------------------------
+# Human-readable HDF5 -> HDXF analysis report
+# -----------------------------------------------------------------------------
+
+def _analysis_human_bytes(value: int) -> str:
+    value_f = float(max(0, int(value)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value_f < 1024.0 or unit == "TiB":
+            return f"{value_f:.2f} {unit}" if unit != "B" else f"{int(value_f)} B"
+        value_f /= 1024.0
+    return f"{value_f:.2f} TiB"
+
+
+def _analysis_metadata_category(path: str, logical_bytes: int = 0) -> str | None:
+    """Classify likely scientific metadata without treating detector frames as metadata."""
+    p = str(path).lower()
+    if p.startswith("/entry/data/"):
+        return None
+    if p.startswith(("/entry/mx/", "/entry/azint/", "/entry/result/")):
+        return None
+    if "calibration" in p or any(token in p for token in ("pedestal", "flatfield", "flat_field")):
+        return "calibration"
+    if "mask" in p or "bad_pixel" in p or "badpixel" in p:
+        return "pixel_mask"
+    if any(token in p for token in (
+        "/transformations/", "/module/", "beam_center", "detector_distance",
+        "/distance", "pixel_direction", "module_offset", "translation", "rotation",
+        "geometry", "orientation",
+    )):
+        return "geometry"
+    if "/beam/" in p or any(token in p for token in ("wavelength", "photon_energy", "beam_energy")):
+        return "beam_information"
+    if any(token in p for token in (
+        "count_time", "frame_time", "exposure", "trigger", "ntrigger", "nimages",
+        "acquisition", "frame_count", "number_of_images", "images_per_file",
+    )):
+        return "acquisition_parameters"
+    if "/instrument/detector" in p and any(token in p for token in (
+        "serial", "detector_number", "description", "manufacturer", "model", "sensor",
+        "pixel_size", "x_pixel_size", "y_pixel_size", "threshold", "firmware", "software_version",
+    )):
+        return "detector_information"
+    if any(token in p for token in (
+        "/entry/sample", "/entry/title", "/entry/start_time", "/entry/end_time",
+        "/entry/experiment", "/entry/program_name", "/entry/definition",
+    )):
+        return "experiment_information"
+    # Small non-frame, non-result datasets are still useful as "other metadata" candidates.
+    if int(logical_bytes) <= 1024 * 1024:
+        return "other_metadata"
+    return None
+
+
+def _analysis_dataset_logical_bytes(dataset: h5py.Dataset) -> int:
+    if dataset.shape is None:
+        return 0
+    if dataset.shape == ():
+        return max(1, int(dataset.dtype.itemsize))
+    try:
+        return int(np.prod(dataset.shape, dtype=np.int64)) * max(1, int(dataset.dtype.itemsize))
+    except Exception:
+        return 0
+
+
+def _analysis_dataset_content_digest(
+    dataset: h5py.Dataset,
+    h5file: h5py.File,
+    *,
+    target_bytes: int = 16 * 1024 * 1024,
+) -> tuple[str | None, str, str | None]:
+    """Return a stable content digest without risking native HDF5 filter crashes.
+
+    IMPORTANT: filtered/chunked detector datasets are NEVER read through
+    ``dataset[...]`` here.  Some Windows HDF5 filter/plugin combinations can
+    terminate the interpreter with an access violation before Python can raise
+    an Exception.  The conversion path already avoids that for Calibration by
+    using ``H5Dread_chunk`` / ``read_direct_chunk``.  The analysis pass must do
+    the same *before* attempting a logical read, not as an exception fallback.
+
+    For filtered datasets the digest covers the exact HDF5 storage/filter
+    descriptor plus every allocated raw filtered chunk.  This is a strict
+    physical-content identity: equal digests mean the stored filtered dataset
+    representation is identical.  For unfiltered datasets we hash logical
+    values as before.
+    """
+    digest = hashlib.sha256()
+
+    if dataset.shape is None:
+        digest.update(b"null-dataspace")
+        return digest.hexdigest(), "logical-values", None
+    if dataset.shape != () and any(int(x) == 0 for x in dataset.shape):
+        digest.update(b"empty-dataset")
+        return digest.hexdigest(), "logical-values", None
+
+    filters = dataset_filter_pipeline(dataset)
+
+    # SAFETY FIRST: never invoke the native filter pipeline during analysis.
+    # A Windows access violation is a process-level crash and cannot be caught
+    # by the try/except below.  Read exact stored chunks directly instead.
+    if filters:
+        if not _supports_raw_chunk_access(dataset):
+            return (
+                None,
+                "filtered-dataset-skipped",
+                "Filtered dataset was not logically read during analysis because raw chunk access is unavailable; skipped to avoid a native HDF5/plugin crash.",
+            )
+        try:
+            digest.update(strict_json_dumps({
+                "identity_mode": "hdf5-filtered-chunks-analysis-v1",
+                "storage": _calibration_storage_identity(dataset, h5file),
+            }))
+            allocated_chunks = 0
+            for offset, filter_mask, raw in _iter_raw_hdf5_chunks(dataset):
+                chunk_doc = {
+                    "offset": list(offset),
+                    "filter_mask": int(filter_mask),
+                    "size": len(raw),
+                }
+                digest.update(strict_json_dumps(chunk_doc))
+                digest.update(raw)
+                allocated_chunks += 1
+            digest.update(strict_json_dumps({
+                "allocated_chunks": allocated_chunks,
+            }))
+            return digest.hexdigest(), "raw-filtered-chunks-safe", None
+        except Exception as raw_exc:
+            return (
+                None,
+                "unreadable-filtered-dataset",
+                f"raw chunk analysis failed: {type(raw_exc).__name__}: {raw_exc}",
+            )
+
+    # Unfiltered datasets are safe to read normally.  Keep this non-fatal for
+    # ordinary Python/HDF5 errors.
+    try:
+        for plan in iter_axis0_slices(dataset, target_bytes):
+            array = read_dataset_slice(dataset, plan)
+            if array.dtype.hasobject:
+                digest.update(strict_json_dumps(encode_value(array, h5file)))
+            else:
+                contiguous = np.ascontiguousarray(array)
+                digest.update(memoryview(contiguous).cast("B"))
+        return digest.hexdigest(), "logical-values", None
+    except Exception as logical_exc:
+        return None, "unreadable", f"{type(logical_exc).__name__}: {logical_exc}"
+
+
+def _analysis_collect_physical_files(
+    writer: "HDXFWriter",
+    master_path: Path,
+) -> list[tuple[str, Path]]:
+    by_id: dict[str, Path] = {}
+    for normalised_path, source_id in writer._source_path_to_id.items():
+        try:
+            by_id[str(source_id)] = Path(normalised_path).resolve()
+        except Exception:
+            continue
+    ordered: list[tuple[str, Path]] = []
+    for item in writer.source_files:
+        source_id = str(item.get("id") or "")
+        path = by_id.get(source_id)
+        if path is None:
+            filename = str(item.get("filename") or "")
+            candidate = (master_path.parent / filename).resolve()
+            if candidate.exists():
+                path = candidate
+        if path is not None and path.exists():
+            ordered.append((source_id, path))
+    if not ordered:
+        ordered.append(("source-000001", master_path.resolve()))
+    return ordered
+
+
+def _analysis_collect_metadata(
+    writer: "HDXFWriter",
+    master_path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    dataset_rows: list[dict[str, Any]] = []
+    attribute_rows: list[dict[str, Any]] = []
+    warnings_out: list[str] = []
+    for source_id, source_path in _analysis_collect_physical_files(writer, master_path):
+        try:
+            with h5r(source_path, "r") as h5file:
+                descriptor, _ = capture_local_hdf5_layout(h5file, source_path)
+                records = descriptor.get("objects", {})
+                for record in records.values():
+                    if not isinstance(record, dict):
+                        continue
+                    path = str(record.get("canonical_path") or "")
+                    obj = safe_get(h5file, path) if path else None
+                    attrs = record.get("attributes") or {}
+                    if isinstance(attrs, dict):
+                        category_for_attrs = _analysis_metadata_category(path, 0) or "other_metadata"
+                        for attr_name, attr_doc in attrs.items():
+                            attr_blob = strict_json_dumps(attr_doc)
+                            attribute_rows.append({
+                                "source_id": source_id,
+                                "filename": source_path.name,
+                                "object_path": path,
+                                "attribute_name": str(attr_name),
+                                "category": category_for_attrs,
+                                "identity": hashlib.sha256(attr_blob).hexdigest(),
+                                "encoded_bytes": len(attr_blob),
+                                "value": attr_doc,
+                            })
+                    if not isinstance(obj, h5py.Dataset):
+                        continue
+                    logical_bytes = _analysis_dataset_logical_bytes(obj)
+                    category = _analysis_metadata_category(path, logical_bytes)
+                    if category is None:
+                        continue
+                    content_sha, identity_mode, read_error = _analysis_dataset_content_digest(obj, h5file)
+                    attr_blob = strict_json_dumps(attrs)
+                    schema_blob = strict_json_dumps({
+                        "shape": None if obj.shape is None else list(obj.shape),
+                        "dtype": hdf5_dtype_info(obj.dtype),
+                    })
+                    dataset_rows.append({
+                        "source_id": source_id,
+                        "filename": source_path.name,
+                        "path": path,
+                        "category": category,
+                        "shape": None if obj.shape is None else list(obj.shape),
+                        "dtype": str(obj.dtype),
+                        "logical_bytes": logical_bytes,
+                        "attributes_sha256": hashlib.sha256(attr_blob).hexdigest(),
+                        "schema_sha256": hashlib.sha256(schema_blob).hexdigest(),
+                        "content_sha256": content_sha,
+                        "identity_mode": identity_mode,
+                        "read_error": read_error,
+                        "attributes": attrs,
+                    })
+                    if read_error:
+                        warnings_out.append(f"{source_path.name}::{path}: {read_error}")
+        except Exception as exc:
+            warnings_out.append(
+                f"Cannot analyse physical file {source_path}: {type(exc).__name__}: {exc}"
+            )
+    return dataset_rows, attribute_rows, warnings_out
+
+
+def _analysis_duplicate_dataset_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        content_sha = row.get("content_sha256")
+        if not content_sha:
+            continue
+        key = (
+            row.get("path"),
+            row.get("schema_sha256"),
+            row.get("attributes_sha256"),
+            row.get("identity_mode"),
+            content_sha,
+        )
+        groups.setdefault(key, []).append(row)
+    result = []
+    for key, items in groups.items():
+        if len(items) <= 1:
+            continue
+        per_copy = max(int(item.get("logical_bytes", 0)) for item in items)
+        result.append({
+            "path": key[0],
+            "category": str(items[0].get("category") or "other_metadata"),
+            "copies": len(items),
+            "redundant_copies": len(items) - 1,
+            "logical_bytes_per_copy": per_copy,
+            "estimated_redundant_logical_bytes": per_copy * (len(items) - 1),
+            "shape": items[0].get("shape"),
+            "dtype": items[0].get("dtype"),
+            "identity_mode": items[0].get("identity_mode"),
+            "content_sha256": items[0].get("content_sha256"),
+            "attributes_sha256": items[0].get("attributes_sha256"),
+            "files": [str(item.get("filename")) for item in items],
+        })
+    result.sort(key=lambda item: (
+        -int(item["estimated_redundant_logical_bytes"]),
+        -int(item["copies"]),
+        str(item["path"]),
+    ))
+    return result
+
+
+def _analysis_duplicate_attribute_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            str(row.get("object_path")),
+            str(row.get("attribute_name")),
+            str(row.get("identity")),
+        )
+        groups.setdefault(key, []).append(row)
+    result = []
+    for key, items in groups.items():
+        if len(items) <= 1:
+            continue
+        per_copy = max(int(item.get("encoded_bytes", 0)) for item in items)
+        result.append({
+            "object_path": key[0],
+            "attribute_name": key[1],
+            "category": str(items[0].get("category") or "other_metadata"),
+            "copies": len(items),
+            "redundant_copies": len(items) - 1,
+            "estimated_redundant_encoded_bytes": per_copy * (len(items) - 1),
+            "identity_sha256": key[2],
+            "value": items[0].get("value"),
+            "files": [str(item.get("filename")) for item in items],
+        })
+    result.sort(key=lambda item: (-int(item["copies"]), item["object_path"], item["attribute_name"]))
+    return result
+
+
+def _analysis_cross_path_matches(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        if not row.get("content_sha256"):
+            continue
+        key = (
+            row.get("schema_sha256"),
+            row.get("attributes_sha256"),
+            row.get("identity_mode"),
+            row.get("content_sha256"),
+        )
+        groups.setdefault(key, []).append(row)
+    result = []
+    for items in groups.values():
+        paths = sorted({str(item.get("path")) for item in items})
+        if len(paths) <= 1:
+            continue
+        result.append({
+            "copies": len(items),
+            "paths": paths,
+            "files_and_paths": [f"{item.get('filename')}::{item.get('path')}" for item in items],
+            "content_sha256": items[0].get("content_sha256"),
+            "dtype": items[0].get("dtype"),
+            "shape": items[0].get("shape"),
+        })
+    result.sort(key=lambda item: (-int(item["copies"]), item["paths"]))
+    return result
+
+
+def _analysis_write_original_structure(
+    stream: Any,
+    writer: "HDXFWriter",
+    master_path: Path,
+) -> tuple[int, int, int, int, int]:
+    file_count = group_count = dataset_count = attribute_count = link_count = 0
+    for source_id, source_path in _analysis_collect_physical_files(writer, master_path):
+        file_count += 1
+        stream.write("\n" + "-" * 100 + "\n")
+        stream.write(f"PHYSICAL HDF5 FILE: {source_path.name}  [{source_id}]\n")
+        stream.write(f"Path: {source_path}\n")
+        try:
+            stream.write(f"Size: {_analysis_human_bytes(source_path.stat().st_size)} ({source_path.stat().st_size} bytes)\n")
+        except Exception:
+            pass
+        try:
+            with h5r(source_path, "r") as h5file:
+                descriptor, _ = capture_local_hdf5_layout(h5file, source_path)
+                objects = list((descriptor.get("objects") or {}).values())
+                objects.sort(key=lambda rec: str(rec.get("canonical_path") or ""))
+                for rec in objects:
+                    if not isinstance(rec, dict):
+                        continue
+                    obj_type = str(rec.get("type") or "unknown")
+                    path = str(rec.get("canonical_path") or "")
+                    attrs = rec.get("attributes") or {}
+                    if obj_type == "group":
+                        group_count += 1
+                        stream.write(f"[GROUP]   {path}\n")
+                        creation = rec.get("creation") or {}
+                        if creation:
+                            stream.write(f"          creation={json.dumps(creation, ensure_ascii=False)}\n")
+                    elif obj_type == "dataset":
+                        dataset_count += 1
+                        storage = rec.get("hdf5_storage") or {}
+                        stream.write(f"[DATASET] {path}\n")
+                        stream.write(f"          shape={storage.get('shape')}\n")
+                        stream.write(f"          dtype={json.dumps(storage.get('dtype'), ensure_ascii=False)}\n")
+                        stream.write(f"          chunks={storage.get('chunks')}\n")
+                        stream.write(f"          compression={storage.get('compression')} options={storage.get('compression_options')}\n")
+                        stream.write(f"          filters={json.dumps(storage.get('filters'), ensure_ascii=False)}\n")
+                        stream.write(f"          shuffle={storage.get('shuffle')} fletcher32={storage.get('fletcher32')} scaleoffset={storage.get('scaleoffset')}\n")
+                        stream.write(f"          fillvalue={json.dumps(storage.get('fillvalue'), ensure_ascii=False)}\n")
+                        stream.write(f"          external_storage={json.dumps(storage.get('external_storage'), ensure_ascii=False)}\n")
+                        creation = rec.get("creation") or {}
+                        if creation:
+                            stream.write(f"          creation={json.dumps(creation, ensure_ascii=False)}\n")
+                    if isinstance(attrs, dict):
+                        attribute_count += len(attrs)
+                        for attr_name, attr_value in attrs.items():
+                            stream.write(
+                                f"          @{attr_name} = "
+                                f"{json.dumps(attr_value, ensure_ascii=False, separators=(',', ':'))}\n"
+                            )
+                links = descriptor.get("links") or []
+                link_count += len(links)
+                if links:
+                    stream.write("\n  Links:\n")
+                    for link in sorted(links, key=lambda item: str(item.get("path") or "")):
+                        stream.write(f"    {json.dumps(link, ensure_ascii=False, separators=(',', ':'))}\n")
+        except Exception as exc:
+            stream.write(f"[ERROR] Could not inspect this file: {type(exc).__name__}: {exc}\n")
+    return file_count, group_count, dataset_count, attribute_count, link_count
+
+
+def _analysis_write_hdxf_structure(
+    stream: Any,
+    output_path: Path,
+    manifest: dict[str, Any],
+    writer: "HDXFWriter",
+) -> None:
+    stream.write("\nHDXF LOGICAL OBJECT GRAPH\n")
+    stream.write("-" * 100 + "\n")
+    source_names = {
+        str(item.get("id")): str(item.get("filename"))
+        for item in manifest.get("source", {}).get("files", [])
+        if isinstance(item, dict)
+    }
+    objects = list((manifest.get("objects") or {}).items())
+    objects.sort(key=lambda pair: (
+        source_names.get(str(pair[1].get("source_file")), ""),
+        str(pair[1].get("source_local_path") or pair[1].get("source_path") or ""),
+    ))
+    for object_id, obj in objects:
+        obj_type = str(obj.get("type") or "unknown")
+        source_id = str(obj.get("source_file") or "")
+        source_name = source_names.get(source_id, source_id)
+        source_path = str(obj.get("source_local_path") or obj.get("source_path") or "")
+        stream.write(f"[{obj_type.upper()}] object={object_id} source={source_name}::{source_path}\n")
+        if obj_type == "dataset":
+            payload = obj.get("payload") or {}
+            stream.write(
+                f"          payload_encoding={payload.get('encoding')} state={payload.get('state')} "
+                f"reconstruction_only={obj.get('reconstruction_only', False)}\n"
+            )
+            members = payload.get("members")
+            if isinstance(members, list):
+                stream.write(f"          payload_members={len(members)}\n")
+                for member in members:
+                    stream.write(
+                        f"            {json.dumps(member, ensure_ascii=False, separators=(',', ':'))}\n"
+                    )
+            if payload.get("recipe") is not None:
+                stream.write(
+                    f"          recipe={json.dumps(payload.get('recipe'), ensure_ascii=False, separators=(',', ':'))}\n"
+                )
+        attrs = obj.get("attributes") or {}
+        if isinstance(attrs, dict) and attrs:
+            stream.write(f"          attributes={len(attrs)}\n")
+        children = obj.get("children")
+        if isinstance(children, list):
+            stream.write(f"          children={len(children)}\n")
+            for child in children:
+                stream.write(f"            {json.dumps(child, ensure_ascii=False, separators=(',', ':'))}\n")
+
+    stream.write("\nHDXF LINKS\n")
+    stream.write("-" * 100 + "\n")
+    for link in manifest.get("links", []) or []:
+        stream.write(json.dumps(link, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    detector_archive = manifest.get("detector_archive")
+    if isinstance(detector_archive, dict):
+        stream.write("\nHDXF DETECTOR ARCHIVE SUMMARY\n")
+        stream.write("-" * 100 + "\n")
+        stream.write(json.dumps(detector_archive, ensure_ascii=False, indent=2) + "\n")
+
+    stream.write("\nHDXF ZIP MEMBER STRUCTURE\n")
+    stream.write("-" * 100 + "\n")
+    try:
+        with zipfile.ZipFile(output_path, "r") as archive:
+            for info in archive.infolist():
+                method = "STORED" if info.compress_type == zipfile.ZIP_STORED else str(info.compress_type)
+                stream.write(
+                    f"{info.filename}\n"
+                    f"    size={info.file_size} ({_analysis_human_bytes(info.file_size)})\n"
+                    f"    compressed_size={info.compress_size} ({_analysis_human_bytes(info.compress_size)})\n"
+                    f"    method={method} crc32={info.CRC:08x}\n"
+                )
+    except Exception as exc:
+        stream.write(f"[ERROR] Could not list HDXF ZIP members: {type(exc).__name__}: {exc}\n")
+
+
+
+
+def _analysis_metadata_field_family(category: str, path: str) -> str:
+    """Return a concise, path-based field family for the human-readable report.
+
+    This intentionally does not inspect or interpret Dataset values.  The labels
+    are based only on the already assigned metadata category and HDF5 path, so
+    the report can explain roughly what kinds of fields are present without
+    exposing potentially huge arrays or pretending to infer scientific meaning
+    from their numeric contents.
+    """
+    category = str(category or "other_metadata")
+    p = str(path).lower()
+    if category != "other_metadata":
+        return category
+    if p.startswith("/entry/detector/"):
+        return "per_frame_detector_auxiliary"
+    if p.startswith("/entry/image/"):
+        return "per_frame_image_diagnostics"
+    if p.startswith("/entry/roi/"):
+        return "per_frame_roi_statistics"
+    if p.startswith("/entry/xfel/"):
+        return "per_frame_xfel_event_fields"
+    if p.startswith("/entry/instrument/detector/detectorspecific/"):
+        return "detector_specific_technical_fields"
+    if p.startswith("/entry/instrument/detector/"):
+        return "detector_flags_and_technical_fields"
+    if p.startswith("/entry/source/"):
+        return "source_information"
+    if p.startswith("/entry/instrument/"):
+        return "instrument_information"
+    return "other_metadata"
+
+
+def _analysis_shape_label(shape: Any) -> str:
+    if shape is None:
+        return "null-dataspace"
+    if shape == []:
+        return "scalar"
+    return str(shape)
+
+
+def _analysis_write_metadata_field_summary(
+    stream: Any,
+    dataset_rows: list[dict[str, Any]],
+    attribute_rows: list[dict[str, Any]],
+    dataset_dupes: list[dict[str, Any]],
+) -> None:
+    """Write a value-free, human-readable inventory of metadata field names.
+
+    The detailed report already contains hashes and complete HDF5 structure.
+    This section is deliberately concise: each unique Dataset path is shown once
+    with its field name, category/family, shape, dtype and how many physical HDF5
+    files contain it.  No Dataset values are read or printed here.
+    """
+    stream.write("\n6. HUMAN-READABLE METADATA FIELD SUMMARY (NO DATA VALUES)\n")
+    stream.write("=" * 100 + "\n")
+    stream.write(
+        "Purpose: show roughly what metadata/auxiliary information exists using field names only.\n"
+        "No scalar values or array contents are printed in this section.\n\n"
+    )
+
+    # Collapse repeated physical-file occurrences down to one row per HDF5 path.
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for row in dataset_rows:
+        by_path.setdefault(str(row.get("path") or ""), []).append(row)
+
+    # Strict-duplicate information is useful context, but we keep it compact.
+    dupes_by_path: dict[str, list[dict[str, Any]]] = {}
+    for item in dataset_dupes:
+        dupes_by_path.setdefault(str(item.get("path") or ""), []).append(item)
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for path, items in by_path.items():
+        if not path:
+            continue
+        first = items[0]
+        category = str(first.get("category") or "other_metadata")
+        family = _analysis_metadata_field_family(category, path)
+        filenames = sorted({str(item.get("filename") or "") for item in items})
+        shapes = sorted({repr(item.get("shape")) for item in items})
+        dtypes = sorted({str(item.get("dtype") or "") for item in items})
+        duplicate_groups = dupes_by_path.get(path, [])
+        largest_identical_group = max(
+            (int(item.get("copies", 0)) for item in duplicate_groups),
+            default=1,
+        )
+        field_name = path.rstrip("/").split("/")[-1] or "/"
+        grouped.setdefault(family, []).append({
+            "field_name": field_name,
+            "path": path,
+            "category": category,
+            "files": filenames,
+            "shapes": shapes,
+            "dtypes": dtypes,
+            "largest_identical_group": largest_identical_group,
+        })
+
+    stream.write(f"Unique Dataset field paths: {len(by_path)}\n")
+    unique_attr_keys = {
+        (str(row.get("object_path") or ""), str(row.get("attribute_name") or ""))
+        for row in attribute_rows
+    }
+    stream.write(f"Unique Attribute field paths: {len(unique_attr_keys)}\n")
+
+    family_order = (
+        "detector_information",
+        "beam_information",
+        "geometry",
+        "acquisition_parameters",
+        "calibration",
+        "pixel_mask",
+        "experiment_information",
+        "per_frame_detector_auxiliary",
+        "per_frame_image_diagnostics",
+        "per_frame_roi_statistics",
+        "per_frame_xfel_event_fields",
+        "detector_specific_technical_fields",
+        "detector_flags_and_technical_fields",
+        "source_information",
+        "instrument_information",
+        "other_metadata",
+    )
+    remaining = sorted(set(grouped) - set(family_order))
+    for family in list(family_order) + remaining:
+        items = grouped.get(family)
+        if not items:
+            continue
+        stream.write(f"\n[{family}]  {len(items)} unique Dataset field(s)\n")
+        stream.write("-" * 100 + "\n")
+        for item in sorted(items, key=lambda value: value["path"]):
+            shapes = ", ".join(item["shapes"])
+            dtypes = ", ".join(item["dtypes"])
+            file_count = len(item["files"])
+            duplicate_note = ""
+            if int(item["largest_identical_group"]) > 1:
+                duplicate_note = (
+                    f", largest_strict_identical_group={item['largest_identical_group']}"
+                )
+            stream.write(
+                f"  - {item['field_name']}\n"
+                f"      path={item['path']}\n"
+                f"      shape={shapes}; dtype={dtypes}; present_in_files={file_count}"
+                f"{duplicate_note}\n"
+            )
+
+    # Attribute names are also metadata fields.  Collapse them by object path + name
+    # and deliberately omit their values.
+    attributes_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in attribute_rows:
+        key = (
+            str(row.get("object_path") or ""),
+            str(row.get("attribute_name") or ""),
+        )
+        attributes_by_key.setdefault(key, []).append(row)
+    if attributes_by_key:
+        stream.write("\n[HDF5 attribute field names]\n")
+        stream.write("-" * 100 + "\n")
+        for (object_path, attr_name), items in sorted(attributes_by_key.items()):
+            files = {str(item.get("filename") or "") for item in items}
+            stream.write(
+                f"  - {object_path}@{attr_name}  present_in_files={len(files)}\n"
+            )
+
+def write_hdf5_hdxf_analysis_log(
+    writer: "HDXFWriter",
+    master_path: Path,
+    output_path: Path,
+    manifest: dict[str, Any],
+    *,
+    log_path: Path,
+) -> Path:
+    """Generate a human-readable TXT report after a successful conversion."""
+    master_path = master_path.resolve()
+    output_path = output_path.resolve()
+    log_path = log_path.resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dataset_rows, attribute_rows, analysis_warnings = _analysis_collect_metadata(writer, master_path)
+    dataset_dupes = _analysis_duplicate_dataset_groups(dataset_rows)
+    attribute_dupes = _analysis_duplicate_attribute_groups(attribute_rows)
+    cross_path = _analysis_cross_path_matches(dataset_rows)
+
+    category_summary: dict[str, dict[str, int]] = {}
+    for item in dataset_dupes:
+        category = str(item["category"])
+        summary = category_summary.setdefault(category, {
+            "duplicate_groups": 0,
+            "copies": 0,
+            "redundant_copies": 0,
+            "redundant_bytes": 0,
+        })
+        summary["duplicate_groups"] += 1
+        summary["copies"] += int(item["copies"])
+        summary["redundant_copies"] += int(item["redundant_copies"])
+        summary["redundant_bytes"] += int(item["estimated_redundant_logical_bytes"])
+
+    source_paths = _analysis_collect_physical_files(writer, master_path)
+    original_size = sum(path.stat().st_size for _, path in source_paths if path.exists())
+    hdxf_size = output_path.stat().st_size if output_path.exists() else 0
+
+    with log_path.open("w", encoding="utf-8-sig", newline="\n") as stream:
+        stream.write("HDF5 -> HDXF CONVERSION ANALYSIS REPORT\n")
+        stream.write("=" * 100 + "\n")
+        stream.write(f"Generated UTC : {utc_now_iso()}\n")
+        stream.write(f"Input master  : {master_path}\n")
+        stream.write(f"Output HDXF   : {output_path}\n")
+        stream.write(f"HDXF version  : {manifest.get('hdxf', {}).get('version')}\n")
+        stream.write(f"Profile       : {manifest.get('hdxf', {}).get('profile')}\n")
+        stream.write("\n")
+
+        stream.write("1. HDF5 / HDXF OVERALL COMPARISON\n")
+        stream.write("=" * 100 + "\n")
+        stream.write(f"Original physical HDF5 files : {len(source_paths)}\n")
+        stream.write(f"Original physical size       : {original_size} ({_analysis_human_bytes(original_size)})\n")
+        stream.write(f"HDXF archive size            : {hdxf_size} ({_analysis_human_bytes(hdxf_size)})\n")
+        if hdxf_size > 0:
+            stream.write(f"Physical size ratio HDF5/HDXF: {original_size / hdxf_size:.4f}x\n")
+        stream.write(f"HDXF logical objects         : {len(manifest.get('objects') or {})}\n")
+        stream.write(f"HDXF links                   : {len(manifest.get('links') or [])}\n")
+        stream.write(f"Payload references           : {writer.payload_reference_count}\n")
+        stream.write(f"Unique payloads              : {len(writer._written_payloads)}\n")
+        stream.write(f"Deduplicated references      : {writer.payload_reference_count - len(writer._written_payloads)}\n")
+        stream.write(f"Frame logical bytes          : {writer.encoding_stats.get('logical_frame_bytes', 0)} ({_analysis_human_bytes(int(writer.encoding_stats.get('logical_frame_bytes', 0)))})\n")
+        stream.write(f"Frame encoded bytes          : {writer.encoding_stats.get('encoded_frame_bytes', 0)} ({_analysis_human_bytes(int(writer.encoding_stats.get('encoded_frame_bytes', 0)))})\n")
+
+        stream.write("\n2. DUPLICATE METADATA SUMMARY BY TYPE\n")
+        stream.write("=" * 100 + "\n")
+        stream.write(
+            "Type                         duplicate_groups   copies   redundant_copies   estimated_redundant_logical_bytes\n"
+        )
+        stream.write("-" * 100 + "\n")
+        for category, summary in sorted(
+            category_summary.items(),
+            key=lambda pair: (-pair[1]["redundant_bytes"], pair[0]),
+        ):
+            stream.write(
+                f"{category:<28} {summary['duplicate_groups']:>16} {summary['copies']:>8} "
+                f"{summary['redundant_copies']:>18} "
+                f"{summary['redundant_bytes']:>14} ({_analysis_human_bytes(summary['redundant_bytes'])})\n"
+            )
+        if not category_summary:
+            stream.write("No strict duplicate metadata groups were found.\n")
+        total_groups = len(dataset_dupes)
+        total_copies = sum(int(item["copies"]) for item in dataset_dupes)
+        total_redundant = sum(int(item["redundant_copies"]) for item in dataset_dupes)
+        total_redundant_bytes = sum(int(item["estimated_redundant_logical_bytes"]) for item in dataset_dupes)
+        stream.write("-" * 100 + "\n")
+        stream.write(
+            f"TOTAL strict duplicate groups={total_groups}, copies={total_copies}, "
+            f"redundant_copies={total_redundant}, estimated_redundant_logical_bytes="
+            f"{total_redundant_bytes} ({_analysis_human_bytes(total_redundant_bytes)})\n"
+        )
+        stream.write(
+            "Definition: same HDF5 path + same shape/dtype + same attributes + same content digest.\n"
+        )
+
+        stream.write("\n3. STRICT DUPLICATE METADATA DATASETS - DETAILS\n")
+        stream.write("=" * 100 + "\n")
+        for index, item in enumerate(dataset_dupes, 1):
+            stream.write(f"\n[DUPLICATE {index:04d}]\n")
+            stream.write(f"type/category       : {item['category']}\n")
+            stream.write(f"path                : {item['path']}\n")
+            stream.write(f"copies              : {item['copies']}\n")
+            stream.write(f"redundant_copies    : {item['redundant_copies']}\n")
+            stream.write(f"logical_bytes/copy  : {item['logical_bytes_per_copy']} ({_analysis_human_bytes(item['logical_bytes_per_copy'])})\n")
+            stream.write(f"redundant_bytes_est : {item['estimated_redundant_logical_bytes']} ({_analysis_human_bytes(item['estimated_redundant_logical_bytes'])})\n")
+            stream.write(f"shape               : {item['shape']}\n")
+            stream.write(f"dtype               : {item['dtype']}\n")
+            stream.write(f"identity_mode       : {item['identity_mode']}\n")
+            stream.write(f"content_sha256      : {item['content_sha256']}\n")
+            stream.write(f"attributes_sha256   : {item['attributes_sha256']}\n")
+            stream.write("files:\n")
+            for filename in item["files"]:
+                stream.write(f"  - {filename}\n")
+        if not dataset_dupes:
+            stream.write("No strict duplicate metadata datasets were found.\n")
+
+        stream.write("\n4. DUPLICATE HDF5 ATTRIBUTES\n")
+        stream.write("=" * 100 + "\n")
+        stream.write(f"Strict duplicate attribute groups: {len(attribute_dupes)}\n")
+        for index, item in enumerate(attribute_dupes, 1):
+            stream.write(f"\n[ATTRIBUTE DUPLICATE {index:04d}]\n")
+            stream.write(f"type/category    : {item['category']}\n")
+            stream.write(f"object_path      : {item['object_path']}\n")
+            stream.write(f"attribute_name   : {item['attribute_name']}\n")
+            stream.write(f"copies           : {item['copies']}\n")
+            stream.write(f"redundant_copies : {item['redundant_copies']}\n")
+            stream.write(f"identity_sha256  : {item['identity_sha256']}\n")
+            stream.write(f"value/schema     : {json.dumps(item['value'], ensure_ascii=False, separators=(',', ':'))}\n")
+            stream.write("files:\n")
+            for filename in item["files"]:
+                stream.write(f"  - {filename}\n")
+
+        stream.write("\n5. CONTENT-ONLY CROSS-PATH METADATA MATCHES (NOT INCLUDED IN STRICT TOTALS)\n")
+        stream.write("=" * 100 + "\n")
+        stream.write(
+            "These have identical shape/dtype, attributes and content, but occur under different HDF5 paths.\n"
+            "They are reported for manual review and are NOT counted as strict duplicate metadata.\n"
+        )
+        for index, item in enumerate(cross_path, 1):
+            stream.write(f"\n[CROSS-PATH {index:04d}] copies={item['copies']} shape={item['shape']} dtype={item['dtype']}\n")
+            stream.write(f"content_sha256={item['content_sha256']}\n")
+            stream.write("paths:\n")
+            for path in item["paths"]:
+                stream.write(f"  - {path}\n")
+            stream.write("occurrences:\n")
+            for value in item["files_and_paths"]:
+                stream.write(f"  - {value}\n")
+        if not cross_path:
+            stream.write("No cross-path identical metadata candidates found.\n")
+
+        _analysis_write_metadata_field_summary(
+            stream, dataset_rows, attribute_rows, dataset_dupes
+        )
+
+        stream.write("\n7. METADATA INVENTORY USED FOR DUPLICATE ANALYSIS\n")
+        stream.write("=" * 100 + "\n")
+        for row in sorted(dataset_rows, key=lambda item: (str(item['category']), str(item['path']), str(item['filename']))):
+            stream.write(
+                f"{row['category']:<24} {row['filename']}::{row['path']} "
+                f"shape={row['shape']} dtype={row['dtype']} logical={row['logical_bytes']} "
+                f"digest={row['content_sha256']} mode={row['identity_mode']}"
+            )
+            if row.get("read_error"):
+                stream.write(f" ERROR={row['read_error']}")
+            stream.write("\n")
+
+        stream.write("\n8. FULL ORIGINAL HDF5 PHYSICAL STRUCTURE\n")
+        stream.write("=" * 100 + "\n")
+        counts = _analysis_write_original_structure(stream, writer, master_path)
+        stream.write("\nORIGINAL HDF5 STRUCTURE TOTALS\n")
+        stream.write("-" * 100 + "\n")
+        stream.write(
+            f"physical_files={counts[0]}, groups={counts[1]}, datasets={counts[2]}, "
+            f"attributes={counts[3]}, links={counts[4]}\n"
+        )
+
+        stream.write("\n9. HDF5 OBJECT -> HDXF OBJECT / PAYLOAD MAPPING\n")
+        stream.write("=" * 100 + "\n")
+        source_names = {
+            str(item.get("id")): str(item.get("filename"))
+            for item in manifest.get("source", {}).get("files", [])
+            if isinstance(item, dict)
+        }
+        mapping_rows = []
+        for object_id, obj in (manifest.get("objects") or {}).items():
+            if not isinstance(obj, dict):
+                continue
+            source_id = str(obj.get("source_file") or "")
+            source_name = source_names.get(source_id, source_id)
+            source_local_path = str(obj.get("source_local_path") or obj.get("source_path") or "")
+            payload = obj.get("payload") or {}
+            mapping_rows.append((source_name, source_local_path, object_id, obj, payload))
+        mapping_rows.sort(key=lambda item: (item[0], item[1]))
+        for source_name, source_local_path, object_id, obj, payload in mapping_rows:
+            stream.write(
+                f"{source_name}::{source_local_path}\n"
+                f"  -> HDXF object={object_id}, type={obj.get('type')}, "
+                f"payload_encoding={payload.get('encoding')}, state={payload.get('state')}, "
+                f"reconstruction_only={obj.get('reconstruction_only', False)}\n"
+            )
+
+        stream.write("\n10. FULL HDXF STRUCTURE\n")
+        stream.write("=" * 100 + "\n")
+        _analysis_write_hdxf_structure(stream, output_path, manifest, writer)
+
+        stream.write("\n11. ANALYSIS WARNINGS\n")
+        stream.write("=" * 100 + "\n")
+        if analysis_warnings:
+            for warning in analysis_warnings:
+                stream.write(f"- {warning}\n")
+        else:
+            stream.write("None.\n")
+
+    return log_path
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert HDF5 detector masters to HDXF v0.4.8 with exact Attribute-schema restoration and conservative automatic auxiliary reconstruction",
@@ -4253,7 +5289,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-mib", type=float, default=16.0, help="Generic/calibration chunk target MiB")
     parser.add_argument("--block-frames", type=int, default=64, help="Frames per detector block (default: 64)")
     parser.add_argument(
-        "--frame-transform", choices=("adaptive", "auto", "raw", "delta"), default="adaptive",
+        "--frame-transform", choices=("delta", "adaptive", "auto", "raw"), default="delta",
         help=(
             "Frame transform. adaptive selects per-tile lossless modes; auto "
             "compares Raw, full chained Delta, and Adaptive for every frame "
@@ -4344,40 +5380,41 @@ def build_parser() -> argparse.ArgumentParser:
             "considered by automatic derived-recipe inference (default: 32 MiB)."
         ),
     )
+    # Backwards-compatible no-op options.  Older command lines may still pass
+    # these flags, but HDF5 -> HDXF no longer reads any legacy template folder.
     parser.add_argument(
         "--legacy-template-dir",
         type=Path,
-        default=DEFAULT_LEGACY_TEMPLATE_DIR,
-        help=(
-            "Directory containing the original master HDF5 template. "
-            "By default the script auto-detects ./legacy_template or ./legacy-template next to this script. "
-            "For detector archives the matching template must be byte-identical "
-            "to the input master."
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--allow-missing-legacy-template",
         action="store_true",
-        help=(
-            "Allow conversion without a matching legacy master template. "
-            "This disables guaranteed exact-master restoration and is intended "
-            "only for non-exact/legacy workflows."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
-        "--blosc-threads", type=int, default=1,
-        help="Blosc2 worker threads (default: 1 for Windows stability)",
+        "--blosc-threads", type=int, default=0,
+        help="Threads per Blosc2 compression operation (0=auto, usually 2)",
     )
     parser.add_argument(
-        "--compute-backend", choices=("cpu", "cpu-vectorized", "cuda", "auto"), default="cpu",
+        "--compute-backend", choices=("cpu", "cpu-vectorized", "cuda", "auto"), default="auto",
         help=("Temporal-Delta compute backend. cuda uses CuPy; auto falls back "
-              "to the low-memory CPU path (default: cpu)"),
+              "to the low-memory CPU path (default: auto)"),
+    )
+    parser.add_argument(
+        "--encode-workers", type=int, default=0,
+        help="Concurrent in-memory frame encoders (0=auto, max 4 by default; 1=serial)",
+    )
+    parser.add_argument(
+        "--pipeline-mib", type=int, default=0,
+        help="Maximum in-flight uncompressed input MiB (0=RAM-aware auto-tune)",
     )
     parser.add_argument("--cuda-device", type=int, default=0, help="CUDA device index (default: 0)")
     parser.add_argument(
         "--gpu-memory-limit-mib", type=int, default=0,
-        help="Optional CuPy device-memory-pool limit in MiB; 0 means unlimited",
+        help="CuPy pool limit in MiB (0=auto, reserves GPU VRAM for other apps)",
     )
     parser.add_argument(
         "--delta-filter", choices=("learn", "auto", "none", "shuffle", "bitshuffle"),
@@ -4413,6 +5450,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--frame-index-layout", choices=("binary", "json"), default="binary",
         help=("Frame-block index layout. binary removes repeated block JSON from "
               "manifest.json (default: binary)"),
+    )
+    parser.add_argument(
+        "--no-analysis-log",
+        action="store_true",
+        help="Do not generate the post-conversion HDF5/HDXF analysis TXT report",
+    )
+    parser.add_argument(
+        "--analysis-log-dir",
+        type=Path,
+        help="Optional directory for <output>_analysis.txt reports (default: next to the HDXF)",
     )
     parser.add_argument(
         "--progress-every", type=int, default=25,
@@ -4495,6 +5542,7 @@ def _print_conversion_summary(
         print(
             "legacy HDF5 restore: "
             f"template={template.get('filename')}, "
+            f"template_source={template.get('source', 'legacy-template')}, "
             f"external_files={len(legacy.get('external_files') or [])}, "
             f"all_external_datasets_archived="
             f"{coverage.get('all_external_datasets_archived')}"
@@ -4581,9 +5629,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not (0.0 <= args.sparse_threshold <= 1.0):
         print("error: --sparse-threshold must be between 0 and 1", file=sys.stderr)
         return 2
-    if args.blosc_threads <= 0:
-        print("error: --blosc-threads must be greater than zero", file=sys.stderr)
+    if (args.blosc_threads < 0 or args.encode_workers < 0 or
+            (args.pipeline_mib != 0 and args.pipeline_mib < 128)):
+        print("error: threads/workers must be >= 0; --pipeline-mib must be 0 or >=128", file=sys.stderr)
         return 2
+    sys_hardware = hardware_snapshot()
+    recommendation = recommend_encoder(sys_hardware)
+    # The memory guard continuously reduces *active* workers as RAM fills up.
+    encode_workers = args.encode_workers or recommendation["workers"]
+    blosc_threads = args.blosc_threads or recommendation["blosc_threads"]
+    pipeline_mib = args.pipeline_mib or recommendation["pipeline_mib"]
+    _progress(f"[AUTO-TUNE] CPU {sys_hardware.logical_cpus} logical; "
+              f"RAM {sys_hardware.available_mib}/{sys_hardware.total_mib} MiB free "
+              f"({sys_hardware.used_percent:.1f}% used, source={sys_hardware.source}); "
+              f"worker ceiling={encode_workers}, Blosc threads={blosc_threads}, "
+              f"pipeline budget={pipeline_mib} MiB")
     if args.progress_every <= 0:
         print("error: --progress-every must be greater than zero", file=sys.stderr)
         return 2
@@ -4627,6 +5687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _progress(
             f"Delta compute backend: {compute_info.get('resolved')}"
             + (f" ({compute_info.get('device_name')})" if compute_info.get('device_name') else "")
+            + (f"; protected CuPy pool={compute_info['gpu_memory_limit_mib']} MiB"
+               if compute_info.get('resolved') == 'cuda-cupy' else "")
         )
     except Exception as exc:
         print(f"error: cannot initialise compute backend: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -4634,8 +5696,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if BLOSC2_AVAILABLE and hasattr(blosc2, "set_nthreads"):
         try:
-            blosc2.set_nthreads(int(args.blosc_threads))
-            _progress(f"Blosc2 threads: {args.blosc_threads}")
+            blosc2.set_nthreads(int(blosc_threads))
+            _progress(f"Blosc2 threads per operation: {blosc_threads}")
         except Exception as exc:
             print(f"[WARN] cannot set Blosc2 threads: {exc}", file=sys.stderr, flush=True)
 
@@ -4713,6 +5775,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress_every=args.progress_every,
                 compute_info=compute_info,
                 cuda_device=args.cuda_device,
+                encode_workers=encode_workers,
+                pipeline_mib=pipeline_mib,
                 delta_filter_policy=args.delta_filter,
                 gc_every=args.gc_every,
                 keyframe_interval_blocks=args.keyframe_interval_blocks,
@@ -4721,11 +5785,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 global_static_scan=args.global_static_scan,
                 manifest_layout=args.manifest_layout,
                 frame_index_layout=args.frame_index_layout,
-                legacy_template_dir=args.legacy_template_dir,
-                require_legacy_template=(
-                    args.profile == "detector-frame-archive"
-                    and not args.allow_missing_legacy_template
-                ),
                 auxiliary_policy=args.auxiliary_policy,
                 auxiliary_derive_max_mib=(
                     args.auxiliary_derive_max_mib
@@ -4738,6 +5797,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload_references=writer.payload_reference_count,
                 unique_payloads=len(writer._written_payloads),
             )
+            if not args.no_analysis_log:
+                try:
+                    analysis_dir = (
+                        args.analysis_log_dir.resolve()
+                        if args.analysis_log_dir is not None
+                        else output.resolve().parent
+                    )
+                    analysis_dir.mkdir(parents=True, exist_ok=True)
+                    analysis_path = analysis_dir / f"{output.stem}_analysis.txt"
+                    # Analysis must use raw HDF5 chunk access for filtered datasets.
+                    # Do not change it back to dataset[...] reads: on Windows some
+                    # detector filter/plugin combinations can cause a fatal access
+                    # violation that bypasses Python exception handling.
+                    written_analysis = write_hdf5_hdxf_analysis_log(
+                        writer,
+                        master,
+                        output,
+                        manifest,
+                        log_path=analysis_path,
+                    )
+                    print(f"analysis report: {written_analysis}")
+                except Exception as analysis_exc:
+                    print(
+                        f"[WARN] analysis report failed for {master.name}: "
+                        f"{type(analysis_exc).__name__}: {analysis_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         except Exception as exc:
             failures += 1
             print(

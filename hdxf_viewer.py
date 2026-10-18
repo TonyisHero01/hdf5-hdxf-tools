@@ -12,7 +12,9 @@ Features:
   - Frame navigation
   - Mouse-wheel zoom centered under the cursor
   - Mouse-drag pan
-  - Temporary manual beam-center anchor: left click to set, right click to clear
+  - Temporary manual beam-center anchor: Ctrl+left click to set, right click to clear
+  - Direct pixel edit: double-left-click one pixel, type a replacement value, press Enter
+  - pyFAI current-frame 1D/2D integration, PONI load/save and control-point geometry refinement
   - Multi-shape ROI: Rectangle, Ellipse, Circle, Annulus, Polygon and Freehand using the right mouse button
   - Beam-center anchor stays fixed while changing frames and never writes source files
   - Fit-to-window and 1:1 display
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import io
 import bisect
 import hashlib
@@ -37,6 +40,8 @@ import math
 import os
 import queue
 import re
+import shutil
+import tempfile
 import shlex
 import struct
 import subprocess
@@ -46,11 +51,14 @@ import time
 import traceback
 import zipfile
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from hdxf_hardware import (snapshot as hdxf_hardware_snapshot,
+                           recommend_encoder as hdxf_recommend_encoder,
+                           nvidia_gpu_overview as hdxf_nvidia_gpu_overview)
 
 try:
     import h5py
@@ -87,6 +95,29 @@ except ImportError as exc:
         "Pillow is required. Install dependencies with:\n"
         "  python -m pip install -r requirements.txt"
     ) from exc
+
+try:
+    import pyFAI  # type: ignore
+    from pyFAI.detectors import Detector as PyFAIDetector  # type: ignore
+    from pyFAI.integrator.azimuthal import AzimuthalIntegrator as PyFAIAzimuthalIntegrator  # type: ignore
+    from pyFAI.io.ponifile import PoniFile as PyFAIPoniFile  # type: ignore
+    from pyFAI.geometryRefinement import GeometryRefinement as PyFAIGeometryRefinement  # type: ignore
+    from pyFAI.calibrant import get_calibrant as pyfai_get_calibrant  # type: ignore
+    from pyFAI.calibrant import ALL_CALIBRANTS as PYFAI_ALL_CALIBRANTS  # type: ignore
+    PYFAI_AVAILABLE = True
+    PYFAI_IMPORT_ERROR = None
+    PYFAI_VERSION = str(getattr(pyFAI, "version", getattr(pyFAI, "__version__", "unknown")))
+except Exception as exc:
+    pyFAI = None  # type: ignore
+    PyFAIDetector = None  # type: ignore
+    PyFAIAzimuthalIntegrator = None  # type: ignore
+    PyFAIPoniFile = None  # type: ignore
+    PyFAIGeometryRefinement = None  # type: ignore
+    pyfai_get_calibrant = None  # type: ignore
+    PYFAI_ALL_CALIBRANTS = {}  # type: ignore
+    PYFAI_AVAILABLE = False
+    PYFAI_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    PYFAI_VERSION = "not installed"
 
 
 def enable_windows_high_dpi_awareness() -> str:
@@ -172,18 +203,6 @@ HDXFB_FORMAT = "hdxfb"
 HDXFB_VERSIONS = (1, 2, 3, 4)
 HDXFB_MAGIC = b"HDXFB\x00\x01"
 MANIFEST_PATH = "manifest.json"
-
-
-def _default_legacy_template_dir() -> Path:
-    """Use the project's current template directory, accepting old spelling."""
-    base = Path(__file__).resolve().parent
-    for candidate in (
-        base / "legacy_template",
-        base / "legacy-template",
-    ):
-        if candidate.is_dir():
-            return candidate
-    return base / "legacy_template"
 
 
 class SafeFileDropController:
@@ -746,6 +765,15 @@ class HDXFArchive:
         self._static_model_cache: dict[str, dict[str, np.ndarray]] = {}
         self._dataset_value_cache: dict[str, Any] = {}
         self._path_objects: dict[str, list[dict[str, Any]]] = {}
+        # New HDXF 0.4.8 archives can carry the original master HDF5 once as
+        # reconstruction/master.h5.  Open it lazily from the ZIP member when
+        # master-local metadata is requested, so Image Info keeps working
+        # without duplicating master Dataset payloads in the manifest.
+        self._embedded_master_member: str | None = None
+        self._embedded_master_sha256: str | None = None
+        self._embedded_master_size: int | None = None
+        self._embedded_master_buffer: io.BytesIO | None = None
+        self._embedded_master_h5: Any | None = None
 
         try:
             manifest = json.loads(self._zip.read(MANIFEST_PATH))
@@ -817,6 +845,23 @@ class HDXFArchive:
                 raise HDXFViewerError(f"Invalid binary frame index: {exc}") from exc
 
         self.manifest = manifest
+
+        legacy = manifest.get("legacy_hdf5")
+        if isinstance(legacy, dict):
+            master_doc = legacy.get("master_template")
+            if isinstance(master_doc, dict) and str(master_doc.get("source") or "") == "embedded-hdxf-member":
+                member = str(master_doc.get("member") or "reconstruction/master.h5")
+                if member not in self._zip.namelist():
+                    self.close()
+                    raise HDXFViewerError(
+                        f"Embedded master declared by manifest is missing: {member}"
+                    )
+                self._embedded_master_member = member
+                expected_sha = master_doc.get("sha256")
+                self._embedded_master_sha256 = str(expected_sha) if isinstance(expected_sha, str) else None
+                expected_size = master_doc.get("size_bytes")
+                self._embedded_master_size = int(expected_size) if isinstance(expected_size, int) else None
+
         objects_root = manifest.get("objects", {})
         if isinstance(objects_root, dict):
             for object_doc in objects_root.values():
@@ -853,11 +898,70 @@ class HDXFArchive:
                 f"The simple viewer requires 2D frames; got {self.frame_shape}"
             )
 
+    def _open_embedded_master(self) -> Any | None:
+        """Open the byte-identical embedded master HDF5 lazily in memory.
+
+        ZIP compression is transparent here: ``ZipFile.read`` returns the exact
+        original HDF5 bytes.  Size/SHA checks protect Image Info from silently
+        using a damaged embedded master.
+        """
+        if self._embedded_master_h5 is not None:
+            return self._embedded_master_h5
+        if self._embedded_master_member is None or h5py is None:
+            return None
+        try:
+            raw = self._zip.read(self._embedded_master_member)
+            if self._embedded_master_size is not None and len(raw) != self._embedded_master_size:
+                raise HDXFViewerError(
+                    f"Embedded master size mismatch: expected {self._embedded_master_size}, got {len(raw)}"
+                )
+            if self._embedded_master_sha256 is not None:
+                actual = hashlib.sha256(raw).hexdigest()
+                if actual != self._embedded_master_sha256:
+                    raise HDXFViewerError(
+                        "Embedded master checksum mismatch: "
+                        f"expected {self._embedded_master_sha256}, got {actual}"
+                    )
+            buffer = io.BytesIO(raw)
+            handle = h5py.File(buffer, "r")
+            self._embedded_master_buffer = buffer
+            self._embedded_master_h5 = handle
+            return handle
+        except HDXFViewerError:
+            raise
+        except Exception as exc:
+            raise HDXFViewerError(
+                f"Cannot open embedded master metadata: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _embedded_master_object(self, path: str) -> Any | None:
+        handle = self._open_embedded_master()
+        if handle is None:
+            return None
+        try:
+            return handle.get(str(path))
+        except Exception:
+            return None
+
     def close(self) -> None:
         self._block_cache.clear()
         self._static_model_cache.clear()
         self._dataset_value_cache.clear()
         self._path_objects.clear()
+        embedded_h5 = getattr(self, "_embedded_master_h5", None)
+        self._embedded_master_h5 = None
+        if embedded_h5 is not None:
+            try:
+                embedded_h5.close()
+            except Exception:
+                pass
+        embedded_buffer = getattr(self, "_embedded_master_buffer", None)
+        self._embedded_master_buffer = None
+        if embedded_buffer is not None:
+            try:
+                embedded_buffer.close()
+            except Exception:
+                pass
         if getattr(self, "_zip", None) is not None:
             self._zip.close()
 
@@ -1037,6 +1141,28 @@ class HDXFArchive:
         if not isinstance(payload, dict) or payload.get("state") not in (None, "present"):
             return None
         encoding = str(payload.get("encoding") or "")
+
+        # New self-contained archives keep master-local HDF5 content only once:
+        # inside reconstruction/master.h5.  Read the requested master Dataset
+        # directly from that byte-identical HDF5 instead of requiring duplicated
+        # generic payload members in manifest.json.
+        if encoding == "embedded-master-reference":
+            object_path = str(payload.get("object_path") or path)
+            try:
+                obj = self._embedded_master_object(object_path)
+                if h5py is None or not isinstance(obj, h5py.Dataset):
+                    return None
+                value = obj[()]
+            except Exception:
+                return None
+            try:
+                nbytes = int(np.asarray(value).nbytes)
+            except Exception:
+                nbytes = 0
+            if nbytes <= 32 * 1024 * 1024:
+                self._dataset_value_cache[path] = value
+            return value
+
         if encoding in ("frame-sequence", "frame-sequence-indexed", "calibration-raw-chunks-v1"):
             return None
         members = payload.get("members")
@@ -1071,6 +1197,15 @@ class HDXFArchive:
         doc = self._dataset_object(path)
         if not isinstance(doc, dict):
             return {}
+        payload = doc.get("payload")
+        if isinstance(payload, dict) and str(payload.get("encoding") or "") == "embedded-master-reference":
+            object_path = str(payload.get("object_path") or path)
+            try:
+                obj = self._embedded_master_object(object_path)
+                if obj is not None:
+                    return {str(key): obj.attrs[key] for key in obj.attrs.keys()}
+            except Exception:
+                return {}
         attrs = doc.get("attributes")
         return dict(attrs) if isinstance(attrs, dict) else {}
 
@@ -1430,6 +1565,11 @@ class HDF5Archive:
 
     def close(self) -> None:
         self._dataset_value_cache.clear()
+        # Release Dataset objects before closing files. ExternalLink-resolved
+        # h5py Dataset handles can otherwise keep the target file open read-only
+        # and block a later live-edit save from reopening the cloned file r+.
+        self._frame_sources.clear()
+        self._source_by_path.clear()
         for handle in list(getattr(self, "_extra_h5", [])):
             try:
                 handle.close()
@@ -2778,6 +2918,8 @@ class ImageCanvas(tk.Canvas):
         view_callback=None,
         beam_center_callback=None,
         roi_callback=None,
+        pixel_edit_callback=None,
+        calibration_point_callback=None,
     ) -> None:
         super().__init__(
             master,
@@ -2791,6 +2933,8 @@ class ImageCanvas(tk.Canvas):
         self.view_callback = view_callback
         self.beam_center_callback = beam_center_callback
         self.roi_callback = roi_callback
+        self.pixel_edit_callback = pixel_edit_callback
+        self.calibration_point_callback = calibration_point_callback
         self.frame: np.ndarray | None = None
         self.display: np.ndarray | None = None
         self.zoom = 1.0
@@ -2802,6 +2946,9 @@ class ImageCanvas(tk.Canvas):
         self._pan_button: int | None = None
         self._pan_dragged = False
         self._pan_threshold_px = 4.0
+        self._beam_center_click_pending = False
+        self._pixel_edit_selection: tuple[int, int] | None = None
+        self._calibration_points: list[tuple[int, int, int]] = []
         # Viewer-only beam center. This coordinate is never written to HDF5/HDXF.
         # It intentionally lives on the persistent canvas so it survives frame changes.
         self.manual_beam_center: tuple[int, int] | None = None
@@ -2864,6 +3011,57 @@ class ImageCanvas(tk.Canvas):
             self.bind(f"<ButtonPress-{button}>", self._pan_begin)
             self.bind(f"<B{button}-Motion>", self._pan_move)
             self.bind(f"<ButtonRelease-{button}>", self._pan_end)
+        self.bind("<Double-Button-1>", self._on_double_left_click)
+
+    @staticmethod
+    def _event_has_control(event: tk.Event) -> bool:
+        # Tk's ControlMask is 0x0004 on the supported Windows/X11 backends.
+        return bool(int(getattr(event, "state", 0) or 0) & 0x0004)
+
+    @staticmethod
+    def _event_has_shift(event: tk.Event) -> bool:
+        # Tk's ShiftMask is 0x0001 on Windows/X11.
+        return bool(int(getattr(event, "state", 0) or 0) & 0x0001)
+
+    def _on_double_left_click(self, event: tk.Event) -> str:
+        """Select one detector pixel for direct live editing.
+
+        Ctrl+double-click remains reserved for the Beam Center gesture.  A
+        normal double-click cancels any pending pan gesture, highlights the
+        selected detector pixel and delegates value editing to the Viewer.
+        """
+        if self.frame is None or self._event_has_control(event) or self._event_has_shift(event):
+            return "break"
+        pixel = self._source_pixel_at_screen(event.x, event.y)
+        if pixel is None:
+            return "break"
+        self._pan_start = None
+        self._pan_button = None
+        self._pan_dragged = False
+        self._beam_center_click_pending = False
+        self._pixel_edit_selection = pixel
+        self.schedule_render()
+        if self.pixel_edit_callback is not None:
+            try:
+                self.pixel_edit_callback(
+                    pixel,
+                    int(getattr(event, "x_root", self.winfo_pointerx())),
+                    int(getattr(event, "y_root", self.winfo_pointery())),
+                )
+            except Exception:
+                self._pixel_edit_selection = None
+                self.schedule_render()
+                raise
+        return "break"
+
+    def clear_pixel_edit_selection(self) -> None:
+        if self._pixel_edit_selection is not None:
+            self._pixel_edit_selection = None
+            self.schedule_render()
+
+    def set_calibration_points(self, points: list[tuple[int, int, int]]) -> None:
+        self._calibration_points = [(int(x), int(y), int(ring)) for x, y, ring in points]
+        self.schedule_render()
 
     def _view_state(self) -> dict[str, float] | None:
         if self.frame is None:
@@ -3082,8 +3280,59 @@ class ImageCanvas(tk.Canvas):
         self._draw_resolution_ring_overlay()
         self._draw_roi_overlay()
         self._draw_beam_center_overlay()
+        self._draw_pixel_edit_selection_overlay()
         self._draw_pointer_overlay()
         self.status_callback(self._current_pointer_info())
+
+    def _draw_pixel_edit_selection_overlay(self) -> None:
+        """Highlight the pixel currently selected by a double-left-click."""
+        self.delete("pixel-edit-selection")
+        if self.frame is None or self._pixel_edit_selection is None:
+            return
+        x, y = self._pixel_edit_selection
+        image_h, image_w = self.frame.shape
+        if not (0 <= x < image_w and 0 <= y < image_h):
+            return
+        x0, y0 = self._source_to_screen(float(x), float(y))
+        x1, y1 = self._source_to_screen(float(x + 1), float(y + 1))
+        width = 3 if self.zoom >= 2.0 else 2
+        self.create_rectangle(
+            x0, y0, x1, y1,
+            outline=UI_WARNING,
+            width=width,
+            tags=("pixel-edit-selection",),
+        )
+        # Crosshair corners remain visible even when the selected pixel is very
+        # small on screen.  They are Viewer-only and never touch detector data.
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        arm = max(5.0, min(10.0, abs(x1 - x0) * 0.6))
+        self.create_line(cx - arm, cy, cx + arm, cy, fill=UI_WARNING, width=1, tags=("pixel-edit-selection",))
+        self.create_line(cx, cy - arm, cx, cy + arm, fill=UI_WARNING, width=1, tags=("pixel-edit-selection",))
+        self.tag_raise("pixel-edit-selection")
+
+    def _draw_calibration_point_overlay(self) -> None:
+        self.delete("calibration-point")
+        if self.frame is None or not self._calibration_points:
+            return
+        for index, (x, y, ring) in enumerate(self._calibration_points, start=1):
+            sx, sy = self._source_to_screen(x + 0.5, y + 0.5)
+            radius = 5.0
+            self.create_oval(
+                sx - radius, sy - radius, sx + radius, sy + radius,
+                outline="#F59E0B", width=2, tags=("calibration-point",),
+            )
+            self.create_line(
+                sx - 8, sy, sx + 8, sy, fill="#F59E0B", width=1, tags=("calibration-point",),
+            )
+            self.create_line(
+                sx, sy - 8, sx, sy + 8, fill="#F59E0B", width=1, tags=("calibration-point",),
+            )
+            self.create_text(
+                sx + 8, sy - 8, anchor="sw", text=f"R{ring}:{index}",
+                fill="#F59E0B", font=("Segoe UI", 8, "bold"), tags=("calibration-point",),
+            )
+        self.tag_raise("calibration-point")
 
     def set_resolution_geometry(self, geometry: dict[str, float] | None) -> None:
         """Set Viewer-only detector geometry used by resolution rings.
@@ -4435,6 +4684,33 @@ class ImageCanvas(tk.Canvas):
             return
         button = int(getattr(event, "num", 0) or 0)
 
+        # pyFAI calibration points use Shift+left-click. The Viewer callback
+        # decides whether point-picking is armed; otherwise Shift+left keeps
+        # the ordinary pan behaviour.
+        if button == 1 and self._event_has_shift(event) and not self._event_has_control(event):
+            pixel = self._source_pixel_at_screen(event.x, event.y)
+            if pixel is not None and self.calibration_point_callback is not None:
+                try:
+                    consumed = bool(self.calibration_point_callback(pixel))
+                except Exception:
+                    consumed = False
+                if consumed:
+                    self._beam_center_click_pending = False
+                    self._pan_start = None
+                    self._pan_button = None
+                    self._pan_dragged = False
+                    return
+
+        # Beam Center is an explicit Ctrl+left-click gesture.  It must not
+        # initiate ROI manipulation or image panning.
+        if button == 1 and self._event_has_control(event):
+            self._beam_center_click_pending = True
+            self._pan_start = None
+            self._pan_button = None
+            self._pan_dragged = False
+            return
+        self._beam_center_click_pending = False
+
         if button == 1 and not self.roi_draw_mode and self.roi is not None:
             resize_mode = self._roi_resize_hit_test(event.x, event.y)
             if resize_mode is not None:
@@ -4473,7 +4749,7 @@ class ImageCanvas(tk.Canvas):
                 return
 
         # ROI drawing deliberately reserves only the RIGHT mouse button. The
-        # left mouse button keeps its existing click-to-anchor / drag-to-pan
+        # left mouse button keeps drag-to-pan; Ctrl+left anchors Beam Center
         # behaviour even while ROI draw mode is armed.
         if self.roi_draw_mode and button == 3:
             pixel = self._source_pixel_at_screen(event.x, event.y)
@@ -4593,6 +4869,19 @@ class ImageCanvas(tk.Canvas):
         self._notify_view_changed()
 
     def _pan_end(self, event: tk.Event) -> None:
+        if self._beam_center_click_pending:
+            self._beam_center_click_pending = False
+            self._pan_start = None
+            self._pan_button = None
+            self._pan_dragged = False
+            source_x, source_y = self._screen_to_source(event.x, event.y)
+            self.set_manual_beam_center(source_x, source_y, notify=True)
+            self._pointer_inside = True
+            self._pointer_xy = (float(event.x), float(event.y))
+            self._refresh_hover_cursor()
+            self.schedule_render()
+            return
+
         if self._roi_resize_mode is not None:
             self._pointer_inside = True
             self._pointer_xy = (float(event.x), float(event.y))
@@ -4711,10 +5000,11 @@ class ImageCanvas(tk.Canvas):
         self._refresh_hover_cursor()
 
         if not dragged:
-            if button == 1:
-                source_x, source_y = self._screen_to_source(event.x, event.y)
-                self.set_manual_beam_center(source_x, source_y, notify=True)
-            elif button == 3:
+            # Ordinary left-click is intentionally inert: double-left-click is
+            # reserved for direct pixel editing and Ctrl+left-click sets Beam
+            # Center.  Right-click still clears a Viewer-only Beam Center when
+            # it was not consumed by ROI drawing.
+            if button == 3:
                 self.clear_manual_beam_center(notify=True)
         else:
             self._notify_view_changed()
@@ -4762,6 +5052,15 @@ class InternalViewState:
     contrast_mode: str = AUTO_CONTRAST_VISIBLE_SPARSE
     invert: bool = False
     show_values: bool = True
+    # Live-edit session state.  Source archives remain read-only; edited frames
+    # are stored as temporary .npy files until the user explicitly saves.
+    source_path: Path | None = None
+    edit_temp_dir: Path | None = None
+    edited_frame_files: dict[int, Path] = field(default_factory=dict)
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.edited_frame_files)
 
     def label(self) -> str:
         filename = self.archive.path.name if self.archive is not None else "No file"
@@ -4995,7 +5294,7 @@ class HDXFViewerApp:
     def __init__(self, root: tk.Misc, manager: ViewerWorkspaceManager, initial_path: Path | None = None) -> None:
         self.root = root
         self.manager = manager
-        self.root.title("HDXF Viewer 0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE")
+        self.root.title("HDXF Viewer 0.5.12.0 · PYFAI ALL-FRAME AVG · LIVE EDIT")
         ui_scale = float(getattr(self.root, "_hdxf_ui_scale", 1.0))
         screen_w = max(1, int(self.root.winfo_screenwidth()))
         screen_h = max(1, int(self.root.winfo_screenheight()))
@@ -5012,6 +5311,9 @@ class HDXFViewerApp:
         self._next_view_id = 1
 
         self.playing = False
+        # Playback is explicitly scoped. ``selected`` advances only the active
+        # pane; ``all`` advances every loaded pane on one shared image index.
+        self.playback_scope = "selected"
         self._play_after_id: str | None = None
         self._play_generation = 0
         self._playback_rendering = False
@@ -5030,6 +5332,94 @@ class HDXFViewerApp:
         self.file_summary_var = tk.StringVar(value="No file open")
         self.active_view_var = tk.StringVar(value="VIEW 01 · NO FILE")
         self.view_count_var = tk.StringVar(value="1 / 4 VIEWS")
+
+        # The right side panel now has two first-class pages. Inspector keeps
+        # visualization/metadata controls, while Tools follows the active view
+        # and launches processing with the CURRENT frame preselected.
+        self.sidebar_page_var = tk.StringVar(value="inspector")
+        self.tools_format_var = tk.StringVar(value="NO ACTIVE DATA")
+        self.tools_file_var = tk.StringVar(value="Open an HDXF or HDF5 file")
+        self.tools_frame_var = tk.StringVar(value="Current image  —")
+        self.tools_view_var = tk.StringVar(value="No active view")
+        self.tools_status_var = tk.StringVar(value="Select a detector view to enable processing tools.")
+        # Inline current-frame editor. Values live in the sidebar rather than
+        # opening the legacy full-screen processing dialog.
+        self.tools_edit_mode_var = tk.StringVar(value="Subtract value")
+        self.tools_edit_value_var = tk.StringVar(value="0")
+        self.tools_edit_value2_var = tk.StringVar()
+        self.tools_edit_fill_var = tk.StringVar(value="0")
+        self.tools_edit_background_var = tk.StringVar()
+        self.tools_edit_background_frame_var = tk.StringVar(value="1")
+        self.tools_edit_use_roi_var = tk.BooleanVar(value=False)
+        self.tools_edit_value_label_var = tk.StringVar(value="SUBTRACT VALUE")
+        self.tools_edit_value2_label_var = tk.StringVar(value="VALUE B")
+        self.tools_edit_session_var = tk.StringVar(value="No unsaved edits")
+
+        # pyFAI integration page. Geometry is auto-filled from the current
+        # HDF5/HDXF metadata and the Viewer-only Ctrl+click Beam Center, while
+        # remaining editable for calibrated/tilted setups. Integration always
+        # uses the current frame, including unsaved temporary pixel edits.
+        self.pyfai_view_var = tk.StringVar(value="No active detector view")
+        self.pyfai_file_var = tk.StringVar(value="Open an HDXF or HDF5 file")
+        self.pyfai_frame_var = tk.StringVar(value="—")
+        self.pyfai_package_var = tk.StringVar(value=f"pyFAI {PYFAI_VERSION}")
+        self.pyfai_status_var = tk.StringVar(value="Select a detector view to configure integration.")
+        self.pyfai_geometry_source_var = tk.StringVar(value="Geometry not loaded")
+        self.pyfai_distance_var = tk.StringVar()
+        self.pyfai_pixel_x_var = tk.StringVar()
+        self.pyfai_pixel_y_var = tk.StringVar()
+        self.pyfai_wavelength_var = tk.StringVar()
+        self.pyfai_beam_x_var = tk.StringVar()
+        self.pyfai_beam_y_var = tk.StringVar()
+        self.pyfai_rot1_var = tk.StringVar(value="0")
+        self.pyfai_rot2_var = tk.StringVar(value="0")
+        self.pyfai_rot3_var = tk.StringVar(value="0")
+        self.pyfai_mode_var = tk.StringVar(value="1D Notebook reference")
+        self.pyfai_notebook_source_var = tk.StringVar(value="All-frame mean")
+        self.pyfai_notebook_npy_var = tk.StringVar(value="")
+        self.pyfai_notebook_bin_var = tk.StringVar(value="2")
+        self.pyfai_notebook_exclude_var = tk.StringVar(value="60")
+        self.pyfai_notebook_gap_var = tk.StringVar(value="500,1100")
+        self.pyfai_notebook_fit_var = tk.BooleanVar(value=True)
+        self.pyfai_notebook_extra_detector_mask_var = tk.BooleanVar(value=False)
+        self.pyfai_unit_var = tk.StringVar(value="q_A^-1")
+        self.pyfai_radial_bins_var = tk.StringVar(value="1000")
+        # 1D all-frame Y-axis averaging. Each detector frame is integrated
+        # independently with identical geometry/radial bins. Frames are processed
+        # in configurable calculation blocks, and block means are merged with a
+        # numerically stable weighted running mean, so no huge all-frame sum is built.
+        self.pyfai_1d_average_size_var = tk.StringVar(value="500")
+        self.pyfai_1d_average_group_var = tk.StringVar(value="All-frame average: —")
+        self.pyfai_azimuth_bins_var = tk.StringVar(value="360")
+        self.pyfai_azimuth_min_var = tk.StringVar(value="-180")
+        self.pyfai_azimuth_max_var = tk.StringVar(value="180")
+        self.pyfai_polarization_var = tk.StringVar()
+        self.pyfai_use_roi_var = tk.BooleanVar(value=False)
+        self.pyfai_use_detector_mask_var = tk.BooleanVar(value=True)
+        self.pyfai_solid_angle_var = tk.BooleanVar(value=True)
+        self.pyfai_poni_file_var = tk.StringVar(value="No PONI file loaded")
+        calibrant_names = sorted(str(name) for name in getattr(PYFAI_ALL_CALIBRANTS, "keys", lambda: [])()) if PYFAI_AVAILABLE else []
+        preferred_calibrant = "LaB6" if "LaB6" in calibrant_names else (calibrant_names[0] if calibrant_names else "LaB6")
+        self.pyfai_calibrant_var = tk.StringVar(value=preferred_calibrant)
+        self.pyfai_ring_index_var = tk.StringVar(value="0")
+        self.pyfai_pick_points_var = tk.BooleanVar(value=False)
+        self.pyfai_refine_mode_var = tk.StringVar(value="Beam center + distance")
+        self.pyfai_calibration_status_var = tk.StringVar(value="No calibration points")
+        self._pyfai_calibrant_names = calibrant_names or ["AgBh", "CeO2", "LaB6", "Si", "alpha_Al2O3"]
+        self._pyfai_calibration_points: list[tuple[int, int, int]] = []
+        self._pyfai_calibration_context: tuple[Any, ...] | None = None
+        self._pyfai_loaded_detector: Any | None = None
+        self._pyfai_geometry_override_source: str | None = None
+        self._pyfai_geometry_context: tuple[Any, ...] | None = None
+        self._pyfai_ai_cache: dict[tuple[Any, ...], Any] = {}
+        self._pyfai_result: dict[str, Any] | None = None
+        self._pyfai_result_window: tk.Toplevel | None = None
+        self._pyfai_result_canvas: tk.Canvas | None = None
+        self._pyfai_result_photo: ImageTk.PhotoImage | None = None
+        self._pyfai_worker: threading.Thread | None = None
+        self._pyfai_queue: queue.Queue[tuple[int, str, Any]] = queue.Queue()
+        self._pyfai_run_serial = 0
+        self._pyfai_poll_after_id: str | None = None
 
         # Shared right-sidebar controls edit the ROI of the currently active
         # internal view. ROI itself remains per-view and Viewer-only.
@@ -5155,78 +5545,157 @@ class HDXFViewerApp:
         app_shell = ttk.Frame(self.root, style="App.TFrame")
         app_shell.pack(fill="both", expand=True)
 
-        topbar = ttk.Frame(app_shell, style="Topbar.TFrame", padding=(14, 9))
+        topbar = ttk.Frame(app_shell, style="Topbar.TFrame", padding=(12, 7))
         topbar.pack(side="top", fill="x")
 
-        brand = ttk.Frame(topbar, style="Topbar.TFrame")
-        brand.pack(side="left", padx=(0, 16), fill="y")
-        tk.Frame(brand, background=UI_ACCENT, width=4, height=48).pack(side="left", fill="y", padx=(0, 10))
+        # Keep branding separate from commands.  The previous single-row bar
+        # could exceed the window width once processing, playback and image
+        # controls were all visible.  Two compact command rows are predictable
+        # even around the application's minimum window width.
+        header_row = ttk.Frame(topbar, style="Topbar.TFrame")
+        header_row.pack(fill="x")
+
+        brand = ttk.Frame(header_row, style="Topbar.TFrame")
+        brand.pack(side="left", fill="y")
+        tk.Frame(brand, background=UI_ACCENT, width=4, height=38).pack(
+            side="left", fill="y", padx=(0, 9)
+        )
         brand_text = ttk.Frame(brand, style="Topbar.TFrame")
         brand_text.pack(side="left", anchor="center")
         ttk.Label(brand_text, text="HDXF VIEWER", style="Brand.TLabel").pack(anchor="w")
-        ttk.Label(brand_text, text="DETECTOR WORKSPACE  ·  0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE", style="BrandSub.TLabel").pack(anchor="w")
+        ttk.Label(
+            brand_text,
+            text="DETECTOR WORKSPACE  ·  0.5.12.0  ·  PYFAI ALL-FRAME AVG  ·  LIVE EDIT",
+            style="BrandSub.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            header_row,
+            textvariable=self.view_count_var,
+            style="TopbarChip.TLabel",
+        ).pack(side="right", padx=(8, 0), anchor="center")
 
-        def toolbar_group(title: str) -> ttk.Frame:
-            outer = ttk.Frame(topbar, style="ToolbarGroup.TFrame", padding=(9, 5))
-            outer.pack(side="left", padx=(0, 7), fill="y")
-            ttk.Label(outer, text=title, style="ToolbarGroupTitle.TLabel").pack(anchor="w", pady=(0, 3))
+        primary_bar = ttk.Frame(topbar, style="Topbar.TFrame")
+        primary_bar.pack(fill="x", pady=(7, 0))
+        secondary_bar = ttk.Frame(topbar, style="Topbar.TFrame")
+        secondary_bar.pack(fill="x", pady=(5, 0))
+
+        def toolbar_group(parent: tk.Misc, title: str) -> ttk.Frame:
+            outer = ttk.Frame(parent, style="ToolbarGroup.TFrame", padding=(7, 4))
+            outer.pack(side="left", padx=(0, 6), fill="y")
+            ttk.Label(
+                outer, text=title, style="ToolbarGroupTitle.TLabel"
+            ).pack(anchor="w", pady=(0, 2))
             row = ttk.Frame(outer, style="ToolbarGroup.TFrame")
             row.pack(anchor="w")
             return row
 
-        workspace = toolbar_group("WORKSPACE")
-        ttk.Button(workspace, text="＋ New View", style="Accent.TButton", command=self.new_window).pack(side="left")
-        ttk.Button(workspace, text="Open", style="Toolbar.TButton", command=self.open_dialog).pack(side="left", padx=(5, 0))
+        def process_menu_button(
+            parent: tk.Misc,
+            text: str,
+            commands: tuple[tuple[str, Any], ...],
+        ) -> ttk.Menubutton:
+            button = ttk.Menubutton(
+                parent, text=text, style="ToolbarMenu.TMenubutton"
+            )
+            menu = tk.Menu(
+                button,
+                tearoff=False,
+                background=UI_TOPBAR,
+                foreground=UI_TEXT,
+                activebackground=UI_ACCENT_STRONG,
+                activeforeground=UI_WHITE,
+                borderwidth=0,
+                relief="flat",
+                font=("Segoe UI", 9),
+            )
+            for label, command in commands:
+                menu.add_command(label=label, command=command)
+            button.configure(menu=menu)
+            return button
 
-        processing_tools = toolbar_group("HDXF PROCESS")
+        # Primary row: commands used constantly while looking at detector data.
+        workspace = toolbar_group(primary_bar, "WORKSPACE")
         ttk.Button(
-            processing_tools, text="Σ Sum / Mean", style="Toolbar.TButton",
-            command=self.open_hdxf_sum_tool,
+            workspace, text="＋ New View", style="Accent.TButton", command=self.new_window
         ).pack(side="left")
         ttk.Button(
-            processing_tools, text="− Subtract", style="Toolbar.TButton",
-            command=self.open_hdxf_subtract_tool,
-        ).pack(side="left", padx=(5, 0))
-        ttk.Button(
-            processing_tools, text="± Pixel Op", style="Toolbar.TButton",
-            command=self.open_hdxf_pixelop_tool,
+            workspace, text="Open", style="Toolbar.TButton", command=self.open_dialog
         ).pack(side="left", padx=(5, 0))
 
-        hdf5_processing_tools = toolbar_group("HDF5 PROCESS")
+        viewport = toolbar_group(primary_bar, "VIEWPORT")
         ttk.Button(
-            hdf5_processing_tools, text="Σ H5", style="Toolbar.TButton",
-            command=self.open_hdf5_sum_tool,
+            viewport, text="Fit", style="Toolbar.TButton", width=5, command=self._fit
         ).pack(side="left")
         ttk.Button(
-            hdf5_processing_tools, text="− H5", style="Toolbar.TButton",
-            command=self.open_hdf5_subtract_tool,
-        ).pack(side="left", padx=(5, 0))
+            viewport, text="1:1", style="Toolbar.TButton", width=4, command=self._one_to_one
+        ).pack(side="left", padx=(4, 0))
         ttk.Button(
-            hdf5_processing_tools, text="± H5", style="Toolbar.TButton",
-            command=self.open_hdf5_pixelop_tool,
-        ).pack(side="left", padx=(5, 0))
+            viewport, text="−", style="Icon.TButton", width=3, command=self._zoom_out
+        ).pack(side="left", padx=(7, 0))
+        ttk.Button(
+            viewport, text="+", style="Icon.TButton", width=3, command=self._zoom_in
+        ).pack(side="left", padx=(3, 0))
 
-        viewport = toolbar_group("VIEWPORT")
-        ttk.Button(viewport, text="Fit", style="Toolbar.TButton", width=5, command=self._fit).pack(side="left")
-        ttk.Button(viewport, text="1:1", style="Toolbar.TButton", width=4, command=self._one_to_one).pack(side="left", padx=(4, 0))
-        ttk.Button(viewport, text="−", style="Icon.TButton", width=3, command=self._zoom_out).pack(side="left", padx=(7, 0))
-        ttk.Button(viewport, text="+", style="Icon.TButton", width=3, command=self._zoom_in).pack(side="left", padx=(3, 0))
-
-        playback = toolbar_group("PLAYBACK")
-        ttk.Button(playback, text="|◀", style="Icon.TButton", width=3, command=lambda: self.load_frame(0)).pack(side="left")
-        ttk.Button(playback, text="◀", style="Icon.TButton", width=3, command=lambda: self.step_frame(-1)).pack(side="left", padx=(3, 0))
-        self.play_button = ttk.Button(playback, text="▶  PLAY", style="Play.TButton", width=9, command=self.toggle_playback)
-        self.play_button.pack(side="left", padx=5)
-        ttk.Button(playback, text="▶", style="Icon.TButton", width=3, command=lambda: self.step_frame(1)).pack(side="left")
+        playback = toolbar_group(primary_bar, "PLAYBACK")
+        ttk.Button(
+            playback, text="|◀", style="Icon.TButton", width=3,
+            command=lambda: self.load_frame(0),
+        ).pack(side="left")
+        ttk.Button(
+            playback, text="◀", style="Icon.TButton", width=3,
+            command=lambda: self.step_frame(-1),
+        ).pack(side="left", padx=(3, 0))
+        self.play_selected_button = ttk.Button(
+            playback,
+            text="▶ SELECTED",
+            style="Play.TButton",
+            width=11,
+            command=lambda: self.toggle_playback("selected"),
+        )
+        self.play_selected_button.pack(side="left", padx=(5, 3))
+        self.play_all_button = ttk.Button(
+            playback,
+            text="▶ ALL",
+            style="PlayAll.TButton",
+            width=7,
+            command=lambda: self.toggle_playback("all"),
+        )
+        self.play_all_button.pack(side="left", padx=(0, 5))
+        # Backward-compatible alias for any older callback/plugin code that
+        # still expects ``play_button`` to exist.
+        self.play_button = self.play_selected_button
+        ttk.Button(
+            playback, text="▶", style="Icon.TButton", width=3,
+            command=lambda: self.step_frame(1),
+        ).pack(side="left")
         ttk.Button(
             playback,
             text="▶|",
             style="Icon.TButton",
             width=3,
-            command=lambda: self.load_frame(self.archive.frame_count - 1 if self.archive else 0),
+            command=lambda: self.load_frame(
+                self.archive.frame_count - 1 if self.archive else 0
+            ),
         ).pack(side="left", padx=(3, 0))
 
-        navigation = toolbar_group("IMAGE")
+        # Secondary row: less frequent processing commands are collapsed from
+        # six permanent buttons into two menus, leaving the image controls ample
+        # room at small window widths.
+        processing = toolbar_group(secondary_bar, "PROCESS")
+        ttk.Button(
+            processing,
+            text="Tools Panel",
+            style="Accent.TButton",
+            command=lambda: self._show_sidebar_page("tools"),
+        ).pack(side="left")
+        ttk.Button(
+            processing,
+            text="Inspector",
+            style="Toolbar.TButton",
+            command=lambda: self._show_sidebar_page("inspector"),
+        ).pack(side="left", padx=(5, 0))
+
+        navigation = toolbar_group(secondary_bar, "IMAGE")
         self.frame_spin = ttk.Spinbox(
             navigation,
             from_=1,
@@ -5239,8 +5708,12 @@ class HDXFViewerApp:
         self.frame_spin.pack(side="left")
         self.frame_spin.bind("<Return>", self._load_frame_from_entry)
         self.frame_spin.bind("<FocusOut>", self._load_frame_from_entry)
-        ttk.Label(navigation, textvariable=self.frame_label_var, style="ToolbarValue.TLabel").pack(side="left", padx=(7, 10))
-        ttk.Label(navigation, text="FPS", style="ToolbarMuted.TLabel").pack(side="left")
+        ttk.Label(
+            navigation, textvariable=self.frame_label_var, style="ToolbarValue.TLabel"
+        ).pack(side="left", padx=(7, 10))
+        ttk.Label(
+            navigation, text="FPS", style="ToolbarMuted.TLabel"
+        ).pack(side="left")
         self.fps_combo = ttk.Combobox(
             navigation,
             width=4,
@@ -5250,9 +5723,9 @@ class HDXFViewerApp:
             style="Modern.TCombobox",
         )
         self.fps_combo.pack(side="left", padx=(4, 7))
-        ttk.Checkbutton(navigation, text="Loop", variable=self.loop_var, style="Toolbar.TCheckbutton").pack(side="left")
-
-        ttk.Label(topbar, textvariable=self.view_count_var, style="TopbarChip.TLabel").pack(side="right", padx=(8, 0), anchor="center")
+        ttk.Checkbutton(
+            navigation, text="Loop", variable=self.loop_var, style="Toolbar.TCheckbutton"
+        ).pack(side="left")
 
         statusbar = ttk.Frame(app_shell, style="Statusbar.TFrame", padding=(12, 5))
         statusbar.pack(side="bottom", fill="x")
@@ -5311,7 +5784,17 @@ class HDXFViewerApp:
         menu.add_cascade(label="View", menu=view_menu)
 
         playback_menu = tk.Menu(menu, **menu_options)
-        playback_menu.add_command(label="Play / Pause", command=self.toggle_playback, accelerator="Space")
+        playback_menu.add_command(
+            label="Play / Pause Selected View",
+            command=lambda: self.toggle_playback("selected"),
+            accelerator="Space",
+        )
+        playback_menu.add_command(
+            label="Play / Pause All Views",
+            command=lambda: self.toggle_playback("all"),
+            accelerator="Shift+Space",
+        )
+        playback_menu.add_separator()
         playback_menu.add_command(label="Previous frame", command=lambda: self.step_frame(-1))
         playback_menu.add_command(label="Next frame", command=lambda: self.step_frame(1))
         menu.add_cascade(label="Playback", menu=playback_menu)
@@ -5436,7 +5919,7 @@ class HDXFViewerApp:
         self.converter_input_var = tk.StringVar()
         self.converter_output_var = tk.StringVar()
         self.converter_preset_var = tk.StringVar(value="Recommended Delta")
-        self.converter_backend_var = tk.StringVar(value="cuda")
+        self.converter_backend_var = tk.StringVar(value="auto")
         self.converter_overwrite_var = tk.BooleanVar(value=True)
         self.converter_open_after_var = tk.BooleanVar(value=False)
         self.converter_save_log_var = tk.BooleanVar(value=False)
@@ -5456,12 +5939,14 @@ class HDXFViewerApp:
         # Advanced values.  These are deliberately represented by constrained
         # controls instead of exposing a free-form command line.
         self.converter_frame_transform_var = tk.StringVar(value="delta")
-        self.converter_block_frames_var = tk.StringVar(value="32")
+        self.converter_block_frames_var = tk.StringVar(value="64")
         self.converter_keyframe_interval_var = tk.StringVar(value="4")
-        self.converter_delta_stream_var = tk.StringVar(value="zero-rle-bitpack")
+        self.converter_delta_stream_var = tk.StringVar(value="auto")
         self.converter_delta_filter_var = tk.StringVar(value="learn")
-        self.converter_zstd_level_var = tk.StringVar(value="3")
-        self.converter_blosc_threads_var = tk.StringVar(value="2")
+        self.converter_zstd_level_var = tk.StringVar(value="7")
+        self.converter_blosc_threads_var = tk.StringVar(value="0")
+        self.converter_encode_workers_var = tk.StringVar(value="0")
+        self.converter_pipeline_mib_var = tk.StringVar(value="0")
         self.converter_global_static_var = tk.StringVar(value="off")
         self.converter_calibration_mode_var = tk.StringVar(value="embedded")
         self.converter_calibration_read_var = tk.StringVar(value="auto")
@@ -5689,36 +6174,26 @@ class HDXFViewerApp:
         # tkinter Variable objects (StringVar/BooleanVar/etc.) are not hashable,
         # so they must not be used as dict keys.  Keep the preset as an ordered
         # sequence of (variable, value) pairs instead.
-        if self.converter_preset_var.get() == "Recommended Delta":
-            values = (
-                (self.converter_frame_transform_var, "delta"),
-                (self.converter_block_frames_var, "32"),
-                (self.converter_keyframe_interval_var, "4"),
-                (self.converter_delta_stream_var, "zero-rle-bitpack"),
-                (self.converter_delta_filter_var, "learn"),
-                (self.converter_zstd_level_var, "3"),
-                (self.converter_blosc_threads_var, "2"),
-                (self.converter_global_static_var, "off"),
-                (self.converter_calibration_mode_var, "embedded"),
-                (self.converter_calibration_read_var, "auto"),
-                (self.converter_frame_index_var, "binary"),
-                (self.converter_manifest_layout_var, "compact"),
-            )
-        else:
-            values = (
-                (self.converter_frame_transform_var, "adaptive"),
-                (self.converter_block_frames_var, "64"),
-                (self.converter_keyframe_interval_var, "4"),
-                (self.converter_delta_stream_var, "auto"),
-                (self.converter_delta_filter_var, "learn"),
-                (self.converter_zstd_level_var, "7"),
-                (self.converter_blosc_threads_var, "1"),
-                (self.converter_global_static_var, "off"),
-                (self.converter_calibration_mode_var, "embedded"),
-                (self.converter_calibration_read_var, "auto"),
-                (self.converter_frame_index_var, "binary"),
-                (self.converter_manifest_layout_var, "compact"),
-            )
+        # Keep the Viewer preset aligned with the tested hdf5_to_hdxf.py defaults.
+        # Delta + automatic stream selection chose zero-RLE bitpack for the
+        # verified Jungfrau dataset while remaining safe for less sparse data.
+        values = (
+            (self.converter_frame_transform_var, "delta"),
+            (self.converter_block_frames_var, "64"),
+            (self.converter_keyframe_interval_var, "4"),
+            (self.converter_delta_stream_var, "auto"),
+            (self.converter_delta_filter_var, "learn"),
+            (self.converter_zstd_level_var, "7"),
+            (self.converter_blosc_threads_var, "0"),
+            (self.converter_encode_workers_var, "0"),
+            (self.converter_pipeline_mib_var, "0"),
+            (self.converter_global_static_var, "off"),
+            (self.converter_calibration_mode_var, "embedded"),
+            (self.converter_calibration_read_var, "auto"),
+            (self.converter_frame_index_var, "binary"),
+            (self.converter_manifest_layout_var, "compact"),
+            (self.converter_backend_var, "auto"),
+        )
         for variable, value in values:
             variable.set(value)
         self._update_converter_options_summary()
@@ -5730,9 +6205,12 @@ class HDXFViewerApp:
         backend = self.converter_backend_var.get().upper()
         text = (
             f"{transform} encoding · {self.converter_block_frames_var.get()} frames per block · "
-            f"{backend} · Zstd level {self.converter_zstd_level_var.get()} · "
+            f"{backend} · Workers {self.converter_encode_workers_var.get()} (0=auto) · "
+            f"RAM budget {self.converter_pipeline_mib_var.get()} (0=auto) · "
+            f"Zstd level {self.converter_zstd_level_var.get()} · "
             f"{self.converter_calibration_mode_var.get().title()} calibration · "
-            f"{self.converter_frame_index_var.get().title()} frame index"
+            f"{self.converter_frame_index_var.get().title()} frame index · "
+            "embedded byte-identical master · selective ZIP"
         )
         self.converter_options_summary_var.set(text)
 
@@ -5902,7 +6380,30 @@ class HDXFViewerApp:
             "Learn tests safe filters on the first block and reuses the best result.",
         )
 
-        performance = section(right, "Performance", "Adjust CPU/GPU use and compression effort.")
+        performance = section(right, "Performance", "Hardware-aware defaults protect RAM/VRAM; 0 = auto.")
+        hardware_text = tk.StringVar()
+
+        def update_hardware_text() -> None:
+            current = hdxf_hardware_snapshot()
+            proposed = hdxf_recommend_encoder(current)
+            hardware_text.set(
+                f"Detected: {current.logical_cpus} logical CPUs · "
+                f"RAM {current.available_mib}/{current.total_mib} MiB free "
+                f"({current.used_percent:.0f}% used). "
+                f"Auto maximum {proposed['workers']} CPU encoders, "
+                f"RAM admission {proposed['active_workers']} now, "
+                f"input budget {proposed['pipeline_mib']} MiB. "
+                f"GPU: {hdxf_nvidia_gpu_overview()}. "
+                "CUDA usability is verified at conversion start."
+            )
+
+        update_hardware_text()
+        ttk.Label(performance, textvariable=hardware_text,
+                  style="CardSubtitle.TLabel", wraplength=420,
+                  justify="left").pack(anchor="w", pady=(0, 5))
+        ttk.Button(performance, text="Refresh hardware estimate",
+                   style="Secondary.TButton", command=update_hardware_text).pack(
+                       anchor="w", pady=(0, 10))
         combo_row(
             performance,
             "Zstd compression level",
@@ -5914,8 +6415,23 @@ class HDXFViewerApp:
             performance,
             "Blosc worker threads",
             self.converter_blosc_threads_var,
-            ("1", "2", "4", "8"),
-            "2 is conservative on Windows. More threads can increase memory and contention.",
+            ("0", "1", "2", "4", "8"),
+            "0 automatically balances Blosc threads with parallel frame encoders.",
+        )
+        combo_row(
+            performance,
+            "Parallel encoding workers",
+            self.converter_encode_workers_var,
+            ("0", "1", "2", "3", "4", "6", "8"),
+            "0 automatically selects CPU workers; ZIP writes remain ordered and safe.",
+        )
+        combo_row(
+            performance,
+            "Pipeline input budget (MiB)",
+            self.converter_pipeline_mib_var,
+            ("0", "128", "256", "512", "768", "1024", "2048"),
+            "0 auto-selects a safe budget from currently available RAM. "
+            "A runtime guard also reduces actual parallelism when RAM fills up.",
         )
         combo_row(
             performance,
@@ -5929,7 +6445,8 @@ class HDXFViewerApp:
             "GPU memory limit (MiB)",
             self.converter_gpu_memory_var,
             ("0", "2048", "3072", "4096", "5120"),
-            "0 lets CuPy manage the pool. Set a limit only when sharing GPU memory.",
+            "0 auto-reserves VRAM for Windows/other apps. Explicit limits "
+            "are capped at a safe value by the GPU guard.",
         )
         combo_row(
             performance,
@@ -6197,6 +6714,8 @@ class HDXFViewerApp:
             "--delta-filter", self.converter_delta_filter_var.get(),
             "--zstd-level", self.converter_zstd_level_var.get(),
             "--blosc-threads", self.converter_blosc_threads_var.get(),
+            "--encode-workers", self.converter_encode_workers_var.get(),
+            "--pipeline-mib", self.converter_pipeline_mib_var.get(),
             "--gc-every", "0",
             "--manifest-layout", self.converter_manifest_layout_var.get(),
             "--calibration-mode", self.converter_calibration_mode_var.get(),
@@ -6316,6 +6835,13 @@ class HDXFViewerApp:
     def _handle_converter_output_line(self, raw_line: str) -> None:
         line = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", raw_line.strip())
         if not line:
+            return
+
+        if "[AUTO-TUNE]" in line or "[RAM GUARD]" in line or "[GPU GUARD]" in line:
+            self.converter_activity_var.set(line[:230])
+            return
+        if "Delta compute backend:" in line:
+            self.converter_activity_var.set(line[:230])
             return
 
         dataset_match = re.search(r"frame dataset\s+(.+?):\s+frames=(\d+).*?blocks=(\d+)", line)
@@ -6657,10 +7183,6 @@ class HDXFViewerApp:
         """Return the fixed sibling HDXF-to-HDF5 converter."""
         return Path(__file__).resolve().with_name("hdxf_to_hdf5.py")
 
-    def _legacy_template_dir(self) -> Path:
-        """Return the template directory used by exact HDF5 restoration."""
-        return _default_legacy_template_dir()
-
     def open_hdxf_to_hdf5_tool(self) -> None:
         """Show an in-window launcher for the external reverse converter."""
         script = self._restore_script_path()
@@ -6686,6 +7208,10 @@ class HDXFViewerApp:
         self._restore_total_frames = 0
         self._restore_total_blocks = 0
         self._restore_done_frames = 0
+        self._restore_done_blocks = 0
+        self._restore_seen_block_keys: set[tuple[int, str, int]] = set()
+        self._restore_current_external_index = 0
+        self._restore_current_external_total = 0
         self._restore_last_progress = 0.0
 
         shell = ttk.Frame(overlay, style="Card.TFrame", padding=(20, 18))
@@ -6715,6 +7241,8 @@ class HDXFViewerApp:
         self.restore_output_var = tk.StringVar()
         self.restore_overwrite_var = tk.BooleanVar(value=True)
         self.restore_verify_var = tk.BooleanVar(value=True)
+        self.restore_workers_var = tk.StringVar(value="0")
+        self.restore_backend_var = tk.StringVar(value="auto")
         self.restore_allow_missing_calibration_var = tk.BooleanVar(value=False)
         self.restore_save_log_var = tk.BooleanVar(value=False)
         self.restore_log_path_var = tk.StringVar()
@@ -6743,24 +7271,24 @@ class HDXFViewerApp:
         add_path_row(0, "INPUT HDXF", self.restore_input_var, self._browse_restore_input)
         add_path_row(1, "OUTPUT FOLDER", self.restore_output_var, self._browse_restore_output)
 
-        template_dir = self._legacy_template_dir()
-        ttk.Label(form, text="MASTER TEMPLATES", style="FieldLabel.TLabel").grid(
+        ttk.Label(form, text="MASTER RESTORE", style="FieldLabel.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
         ttk.Label(
             form,
-            text=str(template_dir),
-            style="ReadoutMuted.TLabel",
+            text="Self-contained HDXF · no external legacy_template folder required",
+            style="ReadoutValue.TLabel",
             wraplength=900,
             justify="left",
         ).grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
         ttk.Label(
             form,
             text=(
-                "Exact restore reads the master filename and SHA-256 from HDXF, "
-                "finds that original master in this template directory, copies it "
-                "byte-for-byte, and rebuilds the external HDF5 files. No Albula "
-                "compatibility rewrite is applied."
+                "New HDXF archives restore reconstruction/master.h5 directly after "
+                "size/SHA-256 validation, so the master is byte-identical. External "
+                "HDF5 files are rebuilt with their recorded chunk/filter layout. "
+                "Older self-describing archives are handled by hdxf_to_hdf5.py without "
+                "changing the Viewer command."
             ),
             style="ReadoutMuted.TLabel",
             wraplength=900,
@@ -6774,17 +7302,33 @@ class HDXFViewerApp:
             variable=self.restore_overwrite_var, style="Modern.TCheckbutton",
         ).pack(side="left")
         ttk.Checkbutton(
-            options, text="Verify every restored frame",
+            options, text="Verify ZIP, master SHA and HDF5 storage structure",
             variable=self.restore_verify_var, style="Modern.TCheckbutton",
         ).pack(side="left", padx=(18, 0))
         ttk.Label(
             options,
-            text="Exact mode requires complete external Dataset coverage",
+            text="Full original-vs-restored 60,000-frame comparison remains a separate regression test",
             style="ReadoutMuted.TLabel",
         ).pack(side="left", padx=(18, 0))
 
+        performance_options = ttk.Frame(form, style="Card.TFrame")
+        performance_options.grid(row=5, column=0, columnspan=3, sticky="w", pady=(3, 4))
+        ttk.Label(performance_options, text="DELTA BACKEND", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Combobox(
+            performance_options, textvariable=self.restore_backend_var,
+            values=("auto", "cuda", "cpu"), state="readonly",
+            style="Modern.TCombobox", width=9,
+        ).pack(side="left", padx=(8, 18))
+        ttk.Label(performance_options, text="PARALLEL FILE WORKERS", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Combobox(
+            performance_options, textvariable=self.restore_workers_var,
+            values=("0", "1", "2", "3", "4"), state="readonly",
+            style="Modern.TCombobox", width=6,
+        ).pack(side="left", padx=(8, 10))
+        ttk.Label(performance_options, text="0 = RAM/GPU-safe automatic", style="ReadoutMuted.TLabel").pack(side="left")
+
         log_options = ttk.Frame(form, style="Card.TFrame")
-        log_options.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 2))
+        log_options.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(2, 2))
         self.restore_save_log_check = ttk.Checkbutton(
             log_options, text="Save detailed log",
             variable=self.restore_save_log_var,
@@ -6794,17 +7338,17 @@ class HDXFViewerApp:
         self.restore_save_log_check.pack(side="left")
 
         ttk.Label(form, text="LOG FILE", style="FieldLabel.TLabel").grid(
-            row=6, column=0, sticky="w", padx=(0, 10), pady=5
+            row=7, column=0, sticky="w", padx=(0, 10), pady=5
         )
         self.restore_log_path_entry = ttk.Entry(
             form, textvariable=self.restore_log_path_var, style="Modern.TEntry"
         )
-        self.restore_log_path_entry.grid(row=6, column=1, sticky="ew", pady=5)
+        self.restore_log_path_entry.grid(row=7, column=1, sticky="ew", pady=5)
         self.restore_log_browse_button = ttk.Button(
             form, text="Browse…", style="Secondary.TButton",
             command=self._browse_restore_log,
         )
-        self.restore_log_browse_button.grid(row=6, column=2, padx=(8, 0), pady=5)
+        self.restore_log_browse_button.grid(row=7, column=2, padx=(8, 0), pady=5)
 
         progress_card = ttk.Frame(shell, style="CardAlt.TFrame", padding=(14, 12))
         progress_card.pack(fill="x", pady=(16, 10))
@@ -6982,7 +7526,6 @@ class HDXFViewerApp:
         script = self._restore_script_path()
         input_text = self.restore_input_var.get().strip()
         output_text = self.restore_output_var.get().strip()
-        template_dir = self._legacy_template_dir()
 
         if validate:
             if not script.is_file():
@@ -6996,13 +7539,6 @@ class HDXFViewerApp:
                 )
             if not output_text:
                 raise HDXFViewerError("select an output folder")
-            if not template_dir.is_dir():
-                raise HDXFViewerError(
-                    "exact HDF5 restoration needs the legacy template directory:\n"
-                    f"{template_dir}\n\n"
-                    "Put the original master HDF5 in that directory using its "
-                    "original filename."
-                )
             if (
                 self.restore_save_log_var.get()
                 and not self.restore_log_path_var.get().strip()
@@ -7011,16 +7547,19 @@ class HDXFViewerApp:
                     "select a log file or turn off Save detailed log"
                 )
 
+        # Keep the public script name/CLI stable.  The current reverse converter
+        # auto-detects embedded-master 0.4.8 archives and also retains its own
+        # backward-compatible old-archive path, so Viewer must not inject a
+        # legacy template dependency here.
         cmd = [sys.executable, "-u", str(script)]
         if input_text:
             cmd.append(input_text)
         if output_text:
             cmd.extend(["-o", output_text])
-
         cmd.extend([
-            "--restore-mode", "exact",
-            "--legacy-template-dir", str(template_dir),
             "--progress-every", "1",
+            "--workers", self.restore_workers_var.get(),
+            "--compute-backend", self.restore_backend_var.get(),
         ])
 
         if self.restore_overwrite_var.get():
@@ -7112,17 +7651,182 @@ class HDXFViewerApp:
         line = raw_line.strip()
         if not line:
             return
-        block_match = re.search(
-            r"\[RESTORE\]\s+frame block\s+(\d+)/(\d+)\s+\((\d+)/(\d+)\s+frames,\s*([0-9.]+)%\)",
-            line,
+
+        # Current hdxf_to_hdf5.py prefixes ordinary progress lines with HH:MM:SS.
+        # Keep old tagged output compatible as well.
+        plain = re.sub(r"^\[\d{2}:\d{2}:\d{2}\]\s*", "", line)
+        lower = plain.lower()
+
+        if lower.startswith("restore build:"):
+            self.restore_stage_var.set("Opening HDXF archive")
+            self.restore_activity_var.set(plain)
+            self._set_restore_progress(1.0)
+            return
+
+        if "hdxf zip integrity: pass" in lower:
+            self.restore_stage_var.set("Checking HDXF integrity")
+            self.restore_activity_var.set("ZIP CRC validation passed; reading reconstruction metadata.")
+            self._set_restore_progress(max(self._restore_last_progress, 2.0))
+            return
+
+        if "embedded master present" in lower:
+            self.restore_stage_var.set("Reading embedded master")
+            self.restore_activity_var.set(
+                "The archive contains its byte-identical original master HDF5; ZIP compression is transparent."
+            )
+            self._set_restore_progress(max(self._restore_last_progress, 3.0))
+            return
+
+        if lower.startswith("embedded master verified:"):
+            name = plain.split(":", 1)[1].strip() if ":" in plain else "master.h5"
+            self.restore_stage_var.set("Embedded master verified")
+            self.restore_activity_var.set(f"Master size/SHA-256 verified: {name}")
+            self._set_restore_progress(max(self._restore_last_progress, 4.0))
+            return
+
+        if lower.startswith("legacy master template verified:"):
+            self.restore_stage_var.set("Legacy master verified")
+            self.restore_activity_var.set(plain)
+            self._set_restore_progress(max(self._restore_last_progress, 4.0))
+            return
+
+        if lower.startswith("old hdxf detected:"):
+            self.restore_stage_var.set("Reconstructing old-archive master")
+            self.restore_activity_var.set(
+                "This older archive has no embedded master; reconstructing it from archived HDF5 records."
+            )
+            self._set_restore_progress(max(self._restore_last_progress, 4.0))
+            return
+
+        external_match = re.search(
+            r"restoring external hdf5\s+(\d+)/(\d+):\s*(.+)$",
+            plain,
+            flags=re.IGNORECASE,
         )
-        if block_match:
-            block_no = int(block_match.group(1))
-            block_total = int(block_match.group(2))
-            done_frames = int(block_match.group(3))
-            total_frames = int(block_match.group(4))
-            percent = float(block_match.group(5))
-            # Reserve 5% for structure creation and 5% for final links/checks.
+        if external_match:
+            current = int(external_match.group(1))
+            total = int(external_match.group(2))
+            filename = external_match.group(3).strip()
+            self._restore_current_external_index = current
+            self._restore_current_external_total = total
+            self.restore_stage_var.set("Rebuilding external HDF5 files")
+            self.restore_activity_var.set(
+                f"External file {current:,} of {total:,}: {filename}"
+            )
+            self.restore_output_info_var.set(f"Data files  {current:,} / {total:,}")
+            if self._restore_total_blocks <= 0 and total > 0:
+                self._set_restore_progress(max(self._restore_last_progress, 5.0 + 88.0 * (current - 1) / total))
+            return
+
+        if "[AUTO-TUNE]" in plain or "[GPU GUARD]" in plain or "[RAM GUARD]" in plain:
+            self.restore_activity_var.set(plain[:230])
+            return
+
+        filter_match = re.search(r"hdf5 filter\s+(\d+)\s+for\s+(.+?):", plain, flags=re.IGNORECASE)
+        if filter_match:
+            filter_id = filter_match.group(1)
+            dataset_path = filter_match.group(2).strip()
+            self.restore_stage_var.set("Restoring HDF5 filter pipeline")
+            self.restore_activity_var.set(
+                f"Recreating filter {filter_id} for {dataset_path} before detector-frame writes."
+            )
+            return
+
+        if "hdf5 filter 32008 effective" in lower:
+            self.restore_stage_var.set("Bitshuffle/LZ4 pipeline verified")
+            self.restore_activity_var.set(
+                "HDF5 filter 32008 set_local produced the recorded effective parameters."
+            )
+            return
+
+        frame_match = re.search(
+            r"restoring frames\s+(.+?):\s*block\s+(\d+)/(\d+)(?:,\s*physical=([0-9.]+)\s*mib)?",
+            plain,
+            flags=re.IGNORECASE,
+        )
+        if frame_match:
+            dataset_path = frame_match.group(1).strip()
+            block_no = int(frame_match.group(2))
+            block_total = int(frame_match.group(3))
+            physical_mib = frame_match.group(4)
+            key = (int(self._restore_current_external_index), dataset_path, block_no)
+            if key not in self._restore_seen_block_keys:
+                self._restore_seen_block_keys.add(key)
+                self._restore_done_blocks = len(self._restore_seen_block_keys)
+
+            self.restore_stage_var.set("Restoring detector frames")
+            if physical_mib is not None:
+                self.restore_activity_var.set(
+                    f"{dataset_path}: block {block_no:,}/{block_total:,}; "
+                    f"compressed HDF5 on disk {float(physical_mib):.2f} MiB."
+                )
+            else:
+                self.restore_activity_var.set(
+                    f"{dataset_path}: block {block_no:,}/{block_total:,}."
+                )
+
+            if self._restore_total_blocks > 0:
+                done_blocks = min(self._restore_done_blocks, self._restore_total_blocks)
+                fraction = done_blocks / self._restore_total_blocks
+                self._set_restore_progress(5.0 + 90.0 * fraction)
+                if self._restore_total_frames > 0:
+                    approx_frames = min(
+                        self._restore_total_frames,
+                        int(round(self._restore_total_frames * fraction)),
+                    )
+                    self.restore_work_var.set(
+                        f"Blocks  {done_blocks:,} / {self._restore_total_blocks:,} · "
+                        f"Frames ≈ {approx_frames:,} / {self._restore_total_frames:,}"
+                    )
+                else:
+                    self.restore_work_var.set(
+                        f"Blocks  {done_blocks:,} / {self._restore_total_blocks:,}"
+                    )
+            return
+
+        if plain.startswith("[DONE]"):
+            self.restore_stage_var.set("Restoration completed")
+            self.restore_activity_var.set(
+                "All external HDF5 files were rebuilt and the master was published last."
+            )
+            self._set_restore_progress(100.0, text="100%")
+            return
+
+        if plain.startswith("[MASTER]"):
+            self.restore_output_info_var.set("Master restored")
+            return
+
+        if plain.startswith("[EXTERNAL_FILES]"):
+            match = re.search(r"\[EXTERNAL_FILES\]\s*(\d+)", plain)
+            if match:
+                self.restore_output_info_var.set(f"External files  {int(match.group(1)):,}")
+            return
+
+        if plain.startswith("[MASTER_SHA256]"):
+            self.restore_stage_var.set("Master byte identity verified")
+            self.restore_activity_var.set(
+                "The restored embedded master matches the archived source SHA-256."
+            )
+            return
+
+        if plain.startswith("[ERROR]") or "traceback" in lower:
+            self.restore_stage_var.set("Restoration error")
+            self.restore_activity_var.set(
+                "The reverse converter reported an error. Open details for diagnostics."
+            )
+            return
+
+        # Compatibility with older reverse-converter log formats.
+        legacy_block = re.search(
+            r"\[RESTORE\]\s+frame block\s+(\d+)/(\d+)\s+\((\d+)/(\d+)\s+frames,\s*([0-9.]+)%\)",
+            plain,
+        )
+        if legacy_block:
+            block_no = int(legacy_block.group(1))
+            block_total = int(legacy_block.group(2))
+            done_frames = int(legacy_block.group(3))
+            total_frames = int(legacy_block.group(4))
+            percent = float(legacy_block.group(5))
             self._set_restore_progress(5.0 + 90.0 * percent / 100.0)
             self.restore_stage_var.set("Restoring detector frames")
             self.restore_activity_var.set(
@@ -7132,92 +7836,19 @@ class HDXFViewerApp:
             self.restore_work_var.set(f"Frames  {done_frames:,} / {total_frames:,}")
             return
 
-        lower = line.lower()
-        if line.startswith("[START]"):
-            self.restore_stage_var.set("Opening HDXF archive")
-            self.restore_activity_var.set("Reading the manifest, frame index and source-file layout.")
-            self._set_restore_progress(1.0)
-        elif "[stage] creating hdf5 files" in lower:
-            self.restore_stage_var.set("Creating HDF5 structure")
-            self.restore_activity_var.set("Creating the master file, external files, Groups and Datasets.")
-            self._set_restore_progress(3.0)
-        elif "[stage] restoring preserved hdf5 datasets" in lower:
-            self.restore_stage_var.set("Restoring metadata datasets")
-            self.restore_activity_var.set("Writing preserved detector metadata and Calibration datasets.")
-            self._set_restore_progress(5.0)
-        elif "[stage] decoding detector frame blocks" in lower:
-            self.restore_stage_var.set("Restoring detector frames")
-            self.restore_activity_var.set("Decoding HDXFB blocks and writing HDF5 frame chunks.")
-            self._set_restore_progress(6.0)
-        elif "[stage] restoring hdf5 links" in lower:
-            self.restore_stage_var.set("Restoring HDF5 links")
-            self.restore_activity_var.set("Recreating ExternalLink, SoftLink and HardLink entries.")
-            self._set_restore_progress(96.0)
-        elif "[stage] resolving hdf5 references" in lower:
-            self.restore_stage_var.set("Resolving HDF5 references")
-            self.restore_activity_var.set("Connecting preserved object and region references.")
-            self._set_restore_progress(97.0)
-        elif "[stage] verifying restored hdf5 structure" in lower:
-            self.restore_stage_var.set("Verifying restored files")
-            self.restore_activity_var.set("Reading back the restored HDF5 structure and links.")
-            self._set_restore_progress(98.0)
-        elif line.startswith("[INFO] output files:"):
-            match = re.search(r"output files:\s*(\d+)", line, flags=re.IGNORECASE)
-            if match:
-                self.restore_output_info_var.set(f"Files  {int(match.group(1))}")
-        elif line.startswith("[OUT master]"):
-            self.restore_output_info_var.set("Master restored")
-            self._set_restore_progress(99.0)
-        elif line.startswith("[SUMMARY]"):
-            match = re.search(r"frames=(\d+).*?warnings=(\d+)", line)
-            if match:
-                self.restore_work_var.set(f"Frames  {int(match.group(1)):,}")
-                self.restore_output_info_var.set(f"Warnings  {int(match.group(2))}")
-        elif "[exact] copying byte-identical master template" in lower:
-            self.restore_stage_var.set("Copying original master")
+        if "[stage] verifying reconstructed hdf5 structure" in lower:
+            self.restore_stage_var.set("Verifying HDF5 structure")
             self.restore_activity_var.set(
-                "The SHA-validated original master is being copied byte-for-byte."
-            )
-            self._set_restore_progress(3.0)
-        elif "[exact] rebuilding external hdf5 structure" in lower:
-            self.restore_stage_var.set("Rebuilding external HDF5 structure")
-            self.restore_activity_var.set(
-                "Recreating the original Groups, Datasets, attributes, links and storage layout."
-            )
-            self._set_restore_progress(max(self._restore_last_progress, 5.0))
-        elif "[stage] restoring exact external dataset values" in lower:
-            self.restore_stage_var.set("Restoring auxiliary Dataset values")
-            self.restore_activity_var.set(
-                "Writing MX, azimuthal-integration, diagnostic and other external Dataset values."
-            )
-            self._set_restore_progress(max(self._restore_last_progress, 8.0))
-        elif "[stage] decoding detector frame blocks" in lower:
-            self.restore_stage_var.set("Restoring detector frames")
-            self.restore_activity_var.set(
-                "Decoding HDXF frame blocks into their original physical HDF5 Datasets."
-            )
-            self._set_restore_progress(max(self._restore_last_progress, 10.0))
-        elif "[stage] resolving exact external hdf5 references" in lower:
-            self.restore_stage_var.set("Resolving HDF5 references")
-            self.restore_activity_var.set(
-                "Restoring deferred HDF5 object and region references."
-            )
-            self._set_restore_progress(max(self._restore_last_progress, 96.0))
-        elif "[stage] verifying reconstructed hdf5 structure" in lower:
-            self.restore_stage_var.set("Verifying exact HDF5 structure")
-            self.restore_activity_var.set(
-                "Checking master SHA-256, external links, Dataset shapes, dtypes, chunks, filters and attributes."
+                "Checking master SHA-256, Dataset shapes, dtypes, chunks and filter pipelines."
             )
             self._set_restore_progress(max(self._restore_last_progress, 98.0))
         elif "[result] pass" in lower:
-            self.restore_stage_var.set("Exact restoration completed")
-            self.restore_activity_var.set(
-                "The original master and external HDF5 structure were restored and verified."
-            )
+            self.restore_stage_var.set("Restoration completed")
+            self.restore_activity_var.set("The HDF5 restore completed and verification passed.")
             self._set_restore_progress(100.0, text="100%")
-        elif "[result] fail" in lower or "traceback" in lower:
+        elif "[result] fail" in lower:
             self.restore_stage_var.set("Restoration error")
-            self.restore_activity_var.set("The reverse converter reported an error. Open details for diagnostics.")
+            self.restore_activity_var.set("The reverse converter reported a failed verification.")
 
     def _start_restore_process(self) -> None:
         if self._restore_process is not None and self._restore_process.poll() is None:
@@ -7230,6 +7861,10 @@ class HDXFViewerApp:
 
         self._restore_stop_requested = False
         self._restore_last_progress = 0.0
+        self._restore_done_blocks = 0
+        self._restore_seen_block_keys.clear()
+        self._restore_current_external_index = 0
+        self._restore_current_external_total = 0
         self.restore_progress_var.set(0.0)
         self.restore_progress_text_var.set("0%")
         self.restore_stage_var.set("Preparing restoration")
@@ -7258,7 +7893,14 @@ class HDXFViewerApp:
         total_frames, total_blocks, file_count = self._estimate_hdxf_restore_work(input_path)
         self._restore_total_frames = total_frames
         self._restore_total_blocks = total_blocks
-        self.restore_work_var.set(f"Frames  {total_frames:,}" if total_frames else "Frames  —")
+        if total_frames and total_blocks:
+            self.restore_work_var.set(
+                f"Blocks  0 / {total_blocks:,} · Frames  0 / {total_frames:,}"
+            )
+        elif total_frames:
+            self.restore_work_var.set(f"Frames  0 / {total_frames:,}")
+        else:
+            self.restore_work_var.set("Frames  —")
         self.restore_output_info_var.set(f"Files  {file_count}" if file_count else "Files  —")
 
         self._append_restore_log("Command:\n" + self._format_command_for_display(cmd) + "\n\n")
@@ -7278,6 +7920,10 @@ class HDXFViewerApp:
         }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            # Restoration can spawn child processes for independent HDF5 files;
+            # isolate their POSIX process group so Stop can terminate them too.
+            popen_kwargs["start_new_session"] = True
         try:
             process = subprocess.Popen(cmd, **popen_kwargs)
         except Exception as exc:
@@ -7350,7 +7996,7 @@ class HDXFViewerApp:
         if return_code == 0:
             self._set_restore_progress(100.0, text="100%")
             self.restore_stage_var.set("Restoration complete")
-            self.restore_activity_var.set("The HDF5 master and external files were restored successfully.")
+            self.restore_activity_var.set("The embedded master and external HDF5 files were restored successfully.")
             self.restore_status_var.set("Completed")
         else:
             self.restore_stage_var.set("Restoration failed")
@@ -7365,11 +8011,24 @@ class HDXFViewerApp:
             return
         self._restore_stop_requested = True
         self.restore_status_var.set("Stopping…")
-        self.restore_activity_var.set("Stopping the reverse converter; partially restored files may remain.")
+        self.restore_activity_var.set("Stopping the reverse converter and its file workers; partial files may remain.")
         try:
-            process.terminate()
+            if sys.platform == "win32":
+                # Terminating only the parent leaves ProcessPoolExecutor worker
+                # processes writing to HDF5 in the background on Windows.
+                subprocess.Popen(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                import signal
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         except Exception:
-            pass
+            try:
+                process.terminate()
+            except Exception:
+                pass
 
     def _close_restore_log_file(self) -> None:
         log_file = getattr(self, "_restore_log_file", None)
@@ -7527,7 +8186,7 @@ class HDXFViewerApp:
         }[kind]
         subtitle = {
             "sum": "Combine selected HDXF frames into one derived frame",
-            "subtract": "Apply background subtraction, thresholds and ROI protection directly to HDXF frames",
+            "subtract": "Apply background subtraction, thresholds, exact-value replacement and ROI protection directly to HDXF frames",
             "pixelop": "Add, subtract, multiply or divide selected pixels directly in HDXF frames",
         }[kind].replace("HDXF", "HDF5")
         if family == "hdf5" and kind == "sum":
@@ -7578,6 +8237,7 @@ class HDXFViewerApp:
         self.processing_background_frame_var = tk.StringVar(value="1")
         self.processing_remove_low_var = tk.StringVar()
         self.processing_remove_high_var = tk.StringVar()
+        self.processing_exact_value_var = tk.StringVar()
         self.processing_upper_var = tk.StringVar()
         self.processing_fill_var = tk.StringVar(value="0")
         self.processing_protect_var = tk.StringVar()
@@ -7666,9 +8326,13 @@ class HDXFViewerApp:
                 options.grid_columnconfigure(column, weight=1)
 
             ttk.Label(options, text="MODE", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+            subtract_modes = ["Background subtraction", "Lower threshold", "Remove inclusive range"]
+            if family == "hdf5":
+                subtract_modes.append("Replace exact value")
+            subtract_modes.append("Copy only")
             mode = ttk.Combobox(
                 options, state="readonly", textvariable=self.processing_mode_var,
-                values=("Background subtraction", "Lower threshold", "Remove inclusive range", "Copy only"),
+                values=tuple(subtract_modes),
                 style="Modern.TCombobox",
             )
             mode.grid(row=0, column=1, sticky="ew", padx=(0, 18), pady=4)
@@ -7713,6 +8377,21 @@ class HDXFViewerApp:
             ttk.Entry(protect_row, textvariable=self.processing_protect_var, style="Modern.TEntry").grid(row=0, column=0, sticky="ew")
             ttk.Button(protect_row, text="Current ROI", style="Secondary.TButton", command=self._processing_use_current_roi).grid(row=0, column=1, padx=(7, 0))
             ttk.Label(options, text="Format: x0,y0,x1,y1", style="CardSubtitle.TLabel").grid(row=4, column=3, sticky="w", pady=(0, 4))
+
+            if family == "hdf5":
+                self.processing_exact_value_label = ttk.Label(
+                    options, text="EXACT VALUE", style="FieldLabel.TLabel"
+                )
+                self.processing_exact_value_label.grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+                self.processing_exact_value_entry = ttk.Entry(
+                    options, textvariable=self.processing_exact_value_var, style="Modern.TEntry"
+                )
+                self.processing_exact_value_entry.grid(row=4, column=1, sticky="ew", padx=(0, 18), pady=4)
+                ttk.Label(
+                    options,
+                    text="Exact match uses the original stored pixel value; FILL VALUE is the replacement.",
+                    style="CardSubtitle.TLabel",
+                ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
             encode = ttk.Frame(options, style="CardAlt.TFrame", padding=(9, 7))
             encode.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
@@ -7923,12 +8602,16 @@ class HDXFViewerApp:
         threshold_enabled = mode == "Lower threshold"
         background_enabled = mode == "Background subtraction"
         range_enabled = mode == "Remove inclusive range"
+        exact_enabled = mode == "Replace exact value"
         for widget in (self.processing_threshold_entry,):
             widget.configure(state="normal" if threshold_enabled else "disabled")
         for widget in (self.processing_background_entry, self.processing_background_button, self.processing_background_frame_entry):
             widget.configure(state="normal" if background_enabled else "disabled")
         for widget in (self.processing_remove_low_entry, self.processing_remove_high_entry):
             widget.configure(state="normal" if range_enabled else "disabled")
+        exact_entry = getattr(self, "processing_exact_value_entry", None)
+        if exact_entry is not None:
+            exact_entry.configure(state="normal" if exact_enabled else "disabled")
 
     def _processing_use_current_roi(self) -> None:
         view = self.active_view
@@ -8108,6 +8791,15 @@ class HDXFViewerApp:
                     if low is None or high is None or float(low) > float(high):
                         raise HDXFViewerError("enter a valid Remove range low/high pair")
                     cmd.extend(["--remove-low", low, "--remove-high", high])
+                elif selected_mode == "Replace exact value":
+                    exact_text = self.processing_exact_value_var.get().strip()
+                    if not exact_text:
+                        raise HDXFViewerError("enter the exact pixel value to replace")
+                    try:
+                        float(exact_text)
+                    except ValueError as exc:
+                        raise HDXFViewerError("Exact value must be numeric") from exc
+                    cmd.extend(["--exact-value", exact_text])
                 upper = self._processing_optional_float(self.processing_upper_var.get(), "Upper threshold")
                 if upper is not None:
                     cmd.extend(["--upper-threshold", upper])
@@ -8170,6 +8862,8 @@ class HDXFViewerApp:
                     raise HDXFViewerError(f"background HDXF does not exist: {background_path}")
                 frame = self._processing_optional_int(self.processing_background_frame_var.get(), "Background frame") or "1"
                 cmd.extend(["--background", background, "--background-frame", frame])
+            elif mode == "Replace exact value":
+                raise HDXFViewerError("Replace exact value is currently available for HDF5 processing only")
             elif mode == "Remove inclusive range":
                 low = self._processing_optional_float(self.processing_remove_low_var.get(), "Remove range low")
                 high = self._processing_optional_float(self.processing_remove_high_var.get(), "Remove range high")
@@ -8604,8 +9298,26 @@ class HDXFViewerApp:
 
 
     def _build_sidebar(self, parent: ttk.Frame) -> None:
-        # The complete inspector is scrollable; each section is a separate
-        # visual card so dense scientific information stays easy to scan.
+        # Two persistent page tabs keep image inspection and processing separate.
+        # The content below remains scrollable on both pages.
+        page_nav = ttk.Frame(parent, style="Side.TFrame", padding=(10, 9, 10, 5))
+        page_nav.pack(fill="x")
+        self.sidebar_inspector_button = ttk.Button(
+            page_nav, text="INSPECTOR", style="Accent.TButton",
+            command=lambda: self._show_sidebar_page("inspector"),
+        )
+        self.sidebar_inspector_button.pack(side="left", fill="x", expand=True)
+        self.sidebar_tools_button = ttk.Button(
+            page_nav, text="TOOLS", style="Secondary.TButton",
+            command=lambda: self._show_sidebar_page("tools"),
+        )
+        self.sidebar_tools_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.sidebar_pyfai_button = ttk.Button(
+            page_nav, text="PYFAI", style="Secondary.TButton",
+            command=lambda: self._show_sidebar_page("pyfai"),
+        )
+        self.sidebar_pyfai_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         scroll_host = ttk.Frame(parent, style="Side.TFrame")
         scroll_host.pack(fill="both", expand=True)
 
@@ -8633,7 +9345,13 @@ class HDXFViewerApp:
         scroll_host.bind("<Enter>", self._enable_sidebar_mousewheel)
         scroll_host.bind("<Leave>", self._disable_sidebar_mousewheel)
 
-        inspector_header = ttk.Frame(sidebar, style="Side.TFrame")
+        self.sidebar_inspector_page = ttk.Frame(sidebar, style="Side.TFrame")
+        self.sidebar_tools_page = ttk.Frame(sidebar, style="Side.TFrame")
+        self.sidebar_pyfai_page = ttk.Frame(sidebar, style="Side.TFrame")
+        self.sidebar_inspector_page.pack(fill="x", expand=True)
+        inspector = self.sidebar_inspector_page
+
+        inspector_header = ttk.Frame(inspector, style="Side.TFrame")
         inspector_header.pack(fill="x", pady=(0, 10))
         header_text = ttk.Frame(inspector_header, style="Side.TFrame")
         header_text.pack(side="left", fill="x", expand=True)
@@ -8641,7 +9359,7 @@ class HDXFViewerApp:
         ttk.Label(header_text, text="ACTIVE DETECTOR VIEW", style="InspectorSub.TLabel").pack(anchor="w")
         ttk.Label(inspector_header, textvariable=self.active_view_var, style="InspectorChip.TLabel").pack(side="right", anchor="center")
 
-        preview = self._make_card(sidebar, "Navigator", "Current frame overview and detector centre")
+        preview = self._make_card(inspector, "Navigator", "Current frame overview and detector centre")
         self.thumbnail_canvas = tk.Canvas(
             preview,
             width=340,
@@ -8653,7 +9371,7 @@ class HDXFViewerApp:
         self.thumbnail_canvas.pack(fill="x")
 
         histogram = self._make_card(
-            sidebar,
+            inspector,
             "Histogram",
             "Edges resize · centre moves · wheel zoom · double-click Auto · right-click Full.",
         )
@@ -8680,7 +9398,7 @@ class HDXFViewerApp:
         self.histogram_canvas.bind("<Configure>", lambda _event: self._update_histogram())
 
         display = self._make_card(
-            sidebar,
+            inspector,
             "Display",
             "Shared by every open view for direct visual comparison.",
         )
@@ -8731,7 +9449,7 @@ class HDXFViewerApp:
         ).pack(anchor="w")
 
         roi_card = self._make_card(
-            sidebar,
+            inspector,
             "Region of Interest",
             "Choose a shape. Right-drag draws Rectangle / Ellipse / Circle / Annulus / Freehand; Polygon uses right-click vertices. Annulus statistics exclude the inner circle.",
         )
@@ -8835,7 +9553,7 @@ class HDXFViewerApp:
             ttk.Label(stats, textvariable=variable, style="ReadoutValue.TLabel").grid(row=row, column=1, sticky="e", pady=(2 if row else 0, 0))
         stats.columnconfigure(1, weight=1)
 
-        image_info = self._make_card(sidebar, "Image Info", "Detector, acquisition and current-frame statistics")
+        image_info = self._make_card(inspector, "Image Info", "Detector, acquisition and current-frame statistics")
         self.image_info_text = tk.Text(
             image_info,
             height=25,
@@ -8857,7 +9575,7 @@ class HDXFViewerApp:
         self.image_info_text.tag_configure("label", font=("Segoe UI", 9, "bold"), foreground=UI_TEXT_MUTED)
         self.image_info_text.pack(fill="x", expand=False)
 
-        metadata = self._make_card(sidebar, "HDF5 Metadata", "Best-effort original HDF5 fields; extra/unclassified values appear under Other Information", pady=(0, 4))
+        metadata = self._make_card(inspector, "HDF5 Metadata", "Best-effort original HDF5 fields; extra/unclassified values appear under Other Information", pady=(0, 4))
         tree_host = ttk.Frame(metadata, style="Card.TFrame")
         tree_host.pack(fill="both", expand=True)
         self.metadata_tree = ttk.Treeview(
@@ -8880,6 +9598,2769 @@ class HDXFViewerApp:
         self.metadata_tree.configure(yscrollcommand=metadata_scroll.set)
         self.metadata_tree.pack(side="left", fill="both", expand=True)
         metadata_scroll.pack(side="right", fill="y")
+        # Build the processing and pyFAI pages after the Inspector widgets exist.
+        self._build_tools_sidebar(self.sidebar_tools_page)
+        self._build_pyfai_sidebar(self.sidebar_pyfai_page)
+        self._refresh_tools_sidebar()
+        self._refresh_pyfai_sidebar(force_geometry=True)
+
+
+    def _show_sidebar_page(self, page: str) -> None:
+        """Switch the right sidebar between Inspector, live Tools and pyFAI."""
+        page = str(page).strip().lower()
+        if page not in ("inspector", "tools", "pyfai"):
+            page = "inspector"
+        required = ("sidebar_inspector_page", "sidebar_tools_page", "sidebar_pyfai_page")
+        if not all(hasattr(self, name) for name in required):
+            return
+        self.sidebar_page_var.set(page)
+        self.sidebar_inspector_page.pack_forget()
+        self.sidebar_tools_page.pack_forget()
+        self.sidebar_pyfai_page.pack_forget()
+        self.sidebar_inspector_button.configure(style="Secondary.TButton")
+        self.sidebar_tools_button.configure(style="Secondary.TButton")
+        self.sidebar_pyfai_button.configure(style="Secondary.TButton")
+        if page == "tools":
+            self.sidebar_tools_page.pack(fill="x", expand=True)
+            self.sidebar_tools_button.configure(style="Accent.TButton")
+            self._refresh_tools_sidebar()
+        elif page == "pyfai":
+            self.sidebar_pyfai_page.pack(fill="x", expand=True)
+            self.sidebar_pyfai_button.configure(style="Accent.TButton")
+            self._refresh_pyfai_sidebar()
+        else:
+            self.sidebar_inspector_page.pack(fill="x", expand=True)
+            self.sidebar_inspector_button.configure(style="Accent.TButton")
+        self._pyfai_sync_calibration_overlay()
+        try:
+            self.sidebar_canvas.yview_moveto(0.0)
+        except tk.TclError:
+            pass
+        self.root.after_idle(self._on_sidebar_content_configure)
+
+    def _build_tools_sidebar(self, parent: ttk.Frame) -> None:
+        """Build the live current-frame editor plus legacy batch-tool access."""
+        header = ttk.Frame(parent, style="Side.TFrame")
+        header.pack(fill="x", pady=(0, 10))
+        header_text = ttk.Frame(header, style="Side.TFrame")
+        header_text.pack(side="left", fill="x", expand=True)
+        ttk.Label(header_text, text="TOOLS", style="InspectorTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            header_text,
+            text="LIVE CURRENT-FRAME EDITOR",
+            style="InspectorSub.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(header, textvariable=self.tools_format_var, style="InspectorChip.TLabel").pack(side="right")
+
+        target = self._make_card(
+            parent,
+            "Current Target",
+            "Edits follow the selected View and current image. The source archive is never modified until Save Changes.",
+        )
+        ttk.Label(target, textvariable=self.tools_view_var, style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            target,
+            textvariable=self.tools_file_var,
+            style="CardSubtitle.TLabel",
+            wraplength=330,
+            justify="left",
+        ).pack(fill="x", pady=(3, 7))
+        frame_strip = ttk.Frame(target, style="CardAlt.TFrame", padding=(9, 7))
+        frame_strip.pack(fill="x")
+        ttk.Label(frame_strip, text="CURRENT IMAGE", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Label(frame_strip, textvariable=self.tools_frame_var, style="ReadoutValue.TLabel").pack(side="right")
+
+        editor = self._make_card(
+            parent,
+            "Subtract / Filter · Current Frame",
+            "Enter values here and apply immediately. Edited frames are kept in a temporary workspace and are visible while you browse/play.",
+        )
+        ttk.Label(editor, text="OPERATION", style="FieldLabel.TLabel").pack(anchor="w")
+        self.tools_edit_mode_combo = ttk.Combobox(
+            editor,
+            state="readonly",
+            textvariable=self.tools_edit_mode_var,
+            values=(
+                "Subtract value",
+                "Background subtraction",
+                "Replace exact value",
+                "Remove inclusive range",
+                "Lower threshold",
+                "Upper threshold",
+            ),
+            style="Modern.TCombobox",
+        )
+        self.tools_edit_mode_combo.pack(fill="x", pady=(3, 8))
+        self.tools_edit_mode_combo.bind("<<ComboboxSelected>>", self._tools_edit_mode_changed)
+
+        value_grid = ttk.Frame(editor, style="Card.TFrame")
+        value_grid.pack(fill="x", pady=(0, 7))
+        value_grid.columnconfigure(0, weight=1)
+        value_grid.columnconfigure(1, weight=1)
+        a_box = ttk.Frame(value_grid, style="Card.TFrame")
+        a_box.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Label(a_box, textvariable=self.tools_edit_value_label_var, style="FieldLabel.TLabel").pack(anchor="w")
+        self.tools_edit_value_entry = ttk.Entry(a_box, textvariable=self.tools_edit_value_var, style="Modern.TEntry")
+        self.tools_edit_value_entry.pack(fill="x", pady=(3, 0))
+        b_box = ttk.Frame(value_grid, style="Card.TFrame")
+        b_box.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(b_box, textvariable=self.tools_edit_value2_label_var, style="FieldLabel.TLabel").pack(anchor="w")
+        self.tools_edit_value2_entry = ttk.Entry(b_box, textvariable=self.tools_edit_value2_var, style="Modern.TEntry")
+        self.tools_edit_value2_entry.pack(fill="x", pady=(3, 0))
+
+        fill_box = ttk.Frame(editor, style="Card.TFrame")
+        fill_box.pack(fill="x", pady=(0, 7))
+        ttk.Label(fill_box, text="REPLACE / FILL WITH", style="FieldLabel.TLabel").pack(anchor="w")
+        self.tools_edit_fill_entry = ttk.Entry(fill_box, textvariable=self.tools_edit_fill_var, style="Modern.TEntry")
+        self.tools_edit_fill_entry.pack(fill="x", pady=(3, 0))
+
+        self.tools_edit_background_box = ttk.Frame(editor, style="CardAlt.TFrame", padding=(8, 7))
+        self.tools_edit_background_box.pack(fill="x", pady=(0, 7))
+        ttk.Label(self.tools_edit_background_box, text="BACKGROUND FILE", style="FieldLabel.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.tools_edit_background_entry = ttk.Entry(
+            self.tools_edit_background_box,
+            textvariable=self.tools_edit_background_var,
+            style="Modern.TEntry",
+        )
+        self.tools_edit_background_entry.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        ttk.Button(
+            self.tools_edit_background_box,
+            text="Browse…",
+            style="Secondary.TButton",
+            command=self._tools_browse_background,
+        ).grid(row=1, column=1, padx=(6, 8), pady=(3, 0))
+        ttk.Label(self.tools_edit_background_box, text="FRAME", style="FieldLabel.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            self.tools_edit_background_box,
+            textvariable=self.tools_edit_background_frame_var,
+            width=7,
+            style="Modern.TEntry",
+        ).grid(row=1, column=2, sticky="ew", pady=(3, 0))
+        self.tools_edit_background_box.columnconfigure(0, weight=1)
+
+        ttk.Checkbutton(
+            editor,
+            text="Apply only inside current ROI",
+            variable=self.tools_edit_use_roi_var,
+            style="Modern.TCheckbutton",
+        ).pack(anchor="w", pady=(0, 8))
+
+        actions = ttk.Frame(editor, style="Card.TFrame")
+        actions.pack(fill="x")
+        self.tools_apply_button = ttk.Button(
+            actions,
+            text="Apply to Current Frame",
+            style="Accent.TButton",
+            command=self._apply_tools_current_frame_edit,
+        )
+        self.tools_apply_button.pack(side="left", fill="x", expand=True)
+        self.tools_revert_frame_button = ttk.Button(
+            actions,
+            text="Revert Frame",
+            style="Secondary.TButton",
+            command=self._revert_tools_current_frame,
+        )
+        self.tools_revert_frame_button.pack(side="left", padx=(6, 0))
+
+        session = self._make_card(
+            parent,
+            "Edit Session",
+            "Changes are temporary until saved. Closing the View or Viewer asks whether to save or discard them.",
+        )
+        ttk.Label(
+            session,
+            textvariable=self.tools_edit_session_var,
+            style="ReadoutValue.TLabel",
+            wraplength=330,
+            justify="left",
+        ).pack(fill="x", pady=(0, 8))
+        session_row = ttk.Frame(session, style="Card.TFrame")
+        session_row.pack(fill="x")
+        self.tools_save_edits_button = ttk.Button(
+            session,
+            text="Save Changes…",
+            style="Accent.TButton",
+            command=self._save_active_view_edits,
+        )
+        self.tools_save_edits_button.pack(fill="x", pady=(0, 6))
+        self.tools_discard_edits_button = ttk.Button(
+            session,
+            text="Discard All Changes",
+            style="Secondary.TButton",
+            command=self._discard_active_view_edits,
+        )
+        self.tools_discard_edits_button.pack(fill="x")
+
+        batch = self._make_card(
+            parent,
+            "Batch / Derived-file Tools",
+            "Use these for multi-frame processing. The live editor above is for immediate current-frame work.",
+        )
+        row1 = ttk.Frame(batch, style="Card.TFrame")
+        row1.pack(fill="x")
+        self.tools_sum_button = ttk.Button(
+            row1, text="Sum / Mean…", style="Secondary.TButton",
+            command=self._open_active_sum_tool,
+        )
+        self.tools_sum_button.pack(side="left", fill="x", expand=True)
+        self.tools_subtract_button = ttk.Button(
+            row1, text="Subtract / Filter…", style="Secondary.TButton",
+            command=self._open_active_subtract_tool,
+        )
+        self.tools_subtract_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.tools_pixelop_button = ttk.Button(
+            batch, text="Pixel Operation…", style="Secondary.TButton",
+            command=self._open_active_pixelop_tool,
+        )
+        self.tools_pixelop_button.pack(fill="x", pady=(6, 0))
+
+        status = ttk.Frame(parent, style="CardAlt.TFrame", padding=(10, 9))
+        status.pack(fill="x", pady=(0, 5))
+        ttk.Label(status, text="STATUS", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Label(
+            status,
+            textvariable=self.tools_status_var,
+            style="ReadoutMuted.TLabel",
+            wraplength=330,
+            justify="left",
+        ).pack(fill="x", pady=(3, 0))
+        self._tools_edit_mode_changed()
+
+    def _build_pyfai_sidebar(self, parent: ttk.Frame) -> None:
+        """Build current-frame pyFAI 1D radial integration and 2D caking UI."""
+        header = ttk.Frame(parent, style="Side.TFrame")
+        header.pack(fill="x", pady=(0, 10))
+        header_text = ttk.Frame(header, style="Side.TFrame")
+        header_text.pack(side="left", fill="x", expand=True)
+        ttk.Label(header_text, text="PYFAI", style="InspectorTitle.TLabel").pack(anchor="w")
+        ttk.Label(header_text, text="AZIMUTHAL INTEGRATION", style="InspectorSub.TLabel").pack(anchor="w")
+        ttk.Label(header, textvariable=self.pyfai_package_var, style="InspectorChip.TLabel").pack(side="right")
+
+        target = self._make_card(
+            parent,
+            "Current Target",
+            "Integration uses the active View's current frame, including unsaved live edits.",
+        )
+        ttk.Label(target, textvariable=self.pyfai_view_var, style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(target, textvariable=self.pyfai_file_var, style="CardSubtitle.TLabel", wraplength=330, justify="left").pack(fill="x", pady=(3, 6))
+        row = ttk.Frame(target, style="CardAlt.TFrame", padding=(9, 7))
+        row.pack(fill="x")
+        ttk.Label(row, text="CURRENT IMAGE", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Label(row, textvariable=self.pyfai_frame_var, style="ReadoutValue.TLabel").pack(side="right")
+
+        geometry = self._make_card(
+            parent,
+            "Geometry",
+            "Auto-filled from HDF5/HDXF. Ctrl+left-click the image to override Beam Center. Values remain editable.",
+        )
+        ttk.Label(geometry, textvariable=self.pyfai_geometry_source_var, style="ReadoutMuted.TLabel", wraplength=330, justify="left").pack(fill="x", pady=(0, 7))
+
+        def pair_row(label_a: str, var_a: tk.StringVar, label_b: str, var_b: tk.StringVar) -> None:
+            line = ttk.Frame(geometry, style="Card.TFrame")
+            line.pack(fill="x", pady=(0, 6))
+            line.columnconfigure(0, weight=1)
+            line.columnconfigure(1, weight=1)
+            left = ttk.Frame(line, style="Card.TFrame")
+            right = ttk.Frame(line, style="Card.TFrame")
+            left.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            right.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+            ttk.Label(left, text=label_a, style="FieldLabel.TLabel").pack(anchor="w")
+            ttk.Entry(left, textvariable=var_a, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+            ttk.Label(right, text=label_b, style="FieldLabel.TLabel").pack(anchor="w")
+            ttk.Entry(right, textvariable=var_b, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+
+        pair_row("DISTANCE (M)", self.pyfai_distance_var, "WAVELENGTH (Å)", self.pyfai_wavelength_var)
+        pair_row("PIXEL X (M)", self.pyfai_pixel_x_var, "PIXEL Y (M)", self.pyfai_pixel_y_var)
+        pair_row("BEAM X (PX)", self.pyfai_beam_x_var, "BEAM Y (PX)", self.pyfai_beam_y_var)
+
+        rotations = ttk.Frame(geometry, style="Card.TFrame")
+        rotations.pack(fill="x", pady=(0, 7))
+        for col in range(3):
+            rotations.columnconfigure(col, weight=1)
+        for col, (label, var) in enumerate((
+            ("ROT1 °", self.pyfai_rot1_var),
+            ("ROT2 °", self.pyfai_rot2_var),
+            ("ROT3 °", self.pyfai_rot3_var),
+        )):
+            box = ttk.Frame(rotations, style="Card.TFrame")
+            box.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 3, 0 if col == 2 else 3))
+            ttk.Label(box, text=label, style="FieldLabel.TLabel").pack(anchor="w")
+            ttk.Entry(box, textvariable=var, style="Modern.TEntry", width=8).pack(fill="x", pady=(3, 0))
+        geometry_actions = ttk.Frame(geometry, style="Card.TFrame")
+        geometry_actions.pack(fill="x")
+        ttk.Button(
+            geometry_actions,
+            text="Reload View",
+            style="Secondary.TButton",
+            command=self._pyfai_reload_view_geometry,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            geometry_actions,
+            text="Load .poni…",
+            style="Secondary.TButton",
+            command=self._load_pyfai_poni,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(
+            geometry_actions,
+            text="Save .poni…",
+            style="Secondary.TButton",
+            command=self._save_pyfai_poni,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Label(
+            geometry,
+            textvariable=self.pyfai_poni_file_var,
+            style="ReadoutMuted.TLabel",
+            wraplength=330,
+            justify="left",
+        ).pack(fill="x", pady=(6, 0))
+
+        calibration = self._make_card(
+            parent,
+            "Geometry Refinement",
+            "Choose a calibrant and ring index, arm point picking, then Shift+left-click several points on that powder ring. Refine uses those control points only.",
+        )
+        cal_row = ttk.Frame(calibration, style="Card.TFrame")
+        cal_row.pack(fill="x", pady=(0, 7))
+        cal_row.columnconfigure(0, weight=1)
+        cal_row.columnconfigure(1, weight=1)
+        c1 = ttk.Frame(cal_row, style="Card.TFrame")
+        c2 = ttk.Frame(cal_row, style="Card.TFrame")
+        c1.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        c2.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(c1, text="CALIBRANT", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_calibrant_combo = ttk.Combobox(
+            c1, state="readonly", textvariable=self.pyfai_calibrant_var,
+            values=tuple(self._pyfai_calibrant_names), style="Modern.TCombobox",
+        )
+        self.pyfai_calibrant_combo.pack(fill="x", pady=(3, 0))
+        ttk.Label(c2, text="RING INDEX (0-BASED)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(c2, textvariable=self.pyfai_ring_index_var, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+
+        ttk.Checkbutton(
+            calibration,
+            text="Pick calibration points · Shift + left-click image",
+            variable=self.pyfai_pick_points_var,
+            style="Modern.TCheckbutton",
+            command=self._pyfai_pick_mode_changed,
+        ).pack(anchor="w", pady=(0, 7))
+        ttk.Label(
+            calibration, textvariable=self.pyfai_calibration_status_var,
+            style="ReadoutMuted.TLabel", wraplength=330, justify="left",
+        ).pack(fill="x", pady=(0, 7))
+        point_actions = ttk.Frame(calibration, style="Card.TFrame")
+        point_actions.pack(fill="x", pady=(0, 7))
+        ttk.Button(
+            point_actions, text="Undo Point", style="Secondary.TButton",
+            command=self._pyfai_undo_calibration_point,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            point_actions, text="Clear Points", style="Secondary.TButton",
+            command=self._pyfai_clear_calibration_points,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        ttk.Label(calibration, text="REFINE PARAMETERS", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_refine_mode_combo = ttk.Combobox(
+            calibration, state="readonly", textvariable=self.pyfai_refine_mode_var,
+            values=("Beam center only", "Beam center + distance", "Full geometry"),
+            style="Modern.TCombobox",
+        )
+        self.pyfai_refine_mode_combo.pack(fill="x", pady=(3, 7))
+        self.pyfai_refine_button = ttk.Button(
+            calibration, text="Refine Geometry from Points", style="Accent.TButton",
+            command=self._refine_pyfai_geometry,
+        )
+        self.pyfai_refine_button.pack(fill="x")
+
+        integration = self._make_card(
+            parent,
+            "Integration",
+            "1D Notebook follows pixel-radius histograms and shows 2θ in degrees. Legacy 1D uses pyFAI and θ in radians. 2D uses pyFAI.",
+        )
+        ttk.Label(integration, text="MODE", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_mode_combo = ttk.Combobox(
+            integration,
+            state="readonly",
+            textvariable=self.pyfai_mode_var,
+            values=("1D Notebook reference", "1D radial integration", "2D cake / azimuthal integration"),
+            style="Modern.TCombobox",
+        )
+        self.pyfai_mode_combo.pack(fill="x", pady=(3, 7))
+        self.pyfai_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._pyfai_mode_changed())
+
+        unit_row = ttk.Frame(integration, style="Card.TFrame")
+        unit_row.pack(fill="x", pady=(0, 7))
+        unit_row.columnconfigure(0, weight=1)
+        unit_row.columnconfigure(1, weight=1)
+        u1 = ttk.Frame(unit_row, style="Card.TFrame")
+        u2 = ttk.Frame(unit_row, style="Card.TFrame")
+        u1.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        u2.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(u1, text="2D RADIAL UNIT", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_unit_combo = ttk.Combobox(
+            u1,
+            state="readonly",
+            textvariable=self.pyfai_unit_var,
+            values=("q_A^-1", "q_nm^-1", "2th_deg", "2th_rad", "r_mm"),
+            style="Modern.TCombobox",
+        )
+        self.pyfai_unit_combo.pack(fill="x", pady=(3, 0))
+        ttk.Label(u2, text="RADIAL BINS", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(u2, textvariable=self.pyfai_radial_bins_var, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+        ttk.Label(
+            integration,
+            text="Notebook 1D: 2θ = atan(radius_px × pixel_mm / distance_mm), degrees. Legacy pyFAI 1D: θ in radians.",
+            style="ReadoutMuted.TLabel",
+            wraplength=330,
+            justify="left",
+        ).pack(fill="x", pady=(0, 7))
+
+        # 1D all-frame averaging operates after pyFAI integration. Every frame
+        # produces I(theta) independently. Frames are processed in small calculation
+        # blocks, then block means are merged into one final mean for the whole dataset.
+        self.pyfai_1d_average_box = ttk.Frame(integration, style="CardAlt.TFrame", padding=(8, 7))
+        self.pyfai_1d_average_box.pack(fill="x", pady=(0, 7))
+        avg_head = ttk.Frame(self.pyfai_1d_average_box, style="CardAlt.TFrame")
+        avg_head.pack(fill="x")
+        ttk.Label(avg_head, text="1D ALL-FRAME AVERAGE", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Label(avg_head, text="stable block processing", style="ReadoutMuted.TLabel").pack(side="right")
+        avg_row = ttk.Frame(self.pyfai_1d_average_box, style="CardAlt.TFrame")
+        avg_row.pack(fill="x", pady=(5, 5))
+        ttk.Label(avg_row, text="FRAMES / CALCULATION BLOCK", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_1d_average_size_entry = ttk.Entry(
+            avg_row, textvariable=self.pyfai_1d_average_size_var, style="Modern.TEntry"
+        )
+        self.pyfai_1d_average_size_entry.pack(fill="x", pady=(3, 0))
+        self.pyfai_1d_average_size_entry.bind("<KeyRelease>", lambda _event: self._pyfai_update_average_group_label())
+        self.pyfai_1d_average_size_entry.bind("<Return>", lambda _event: self._pyfai_update_average_group_label())
+        ttk.Label(
+            self.pyfai_1d_average_box,
+            textvariable=self.pyfai_1d_average_group_var,
+            style="ReadoutMuted.TLabel",
+            wraplength=320,
+            justify="left",
+        ).pack(fill="x")
+        ttk.Label(
+            self.pyfai_1d_average_box,
+            text=(
+                "All frames are integrated separately. Each calculation block is averaged first, "
+                "then block means are merged with frame-count weighting into one final I(θ) curve."
+            ),
+            style="ReadoutMuted.TLabel",
+            wraplength=320,
+            justify="left",
+        ).pack(fill="x", pady=(3, 0))
+
+        # Optional reference reduction. The Notebook uses NumPy/SciPy, not pyFAI,
+        # and integrates an *already averaged image*, with three mask stages.
+        self.pyfai_notebook_box = ttk.Frame(integration, style="CardAlt.TFrame", padding=(8, 7))
+        ttk.Label(self.pyfai_notebook_box, text="NOTEBOOK 2D_1D_Plots REFERENCE", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Label(self.pyfai_notebook_box, text="INPUT IMAGE", style="FieldLabel.TLabel").pack(anchor="w", pady=(5, 0))
+        ttk.Combobox(self.pyfai_notebook_box, state="readonly",
+                     textvariable=self.pyfai_notebook_source_var,
+                     values=("All-frame mean", "Current frame", "Reference .npy"),
+                     style="Modern.TCombobox").pack(fill="x", pady=(3, 5))
+        fpath = ttk.Frame(self.pyfai_notebook_box, style="CardAlt.TFrame")
+        fpath.pack(fill="x", pady=(0, 5))
+        ttk.Entry(fpath, textvariable=self.pyfai_notebook_npy_var, style="Modern.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Button(fpath, text="NPY…", style="Secondary.TButton", command=self._notebook_pick_npy).pack(side="right", padx=(5, 0))
+        ttk.Label(self.pyfai_notebook_box, text="RADIAL BIN WIDTH (PX)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(self.pyfai_notebook_box, textvariable=self.pyfai_notebook_bin_var, style="Modern.TEntry").pack(fill="x", pady=(3, 5))
+        ttk.Label(self.pyfai_notebook_box, text="EXCLUDE CENTER RADIUS (PX)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(self.pyfai_notebook_box, textvariable=self.pyfai_notebook_exclude_var, style="Modern.TEntry").pack(fill="x", pady=(3, 5))
+        ttk.Label(self.pyfai_notebook_box, text="GAP ROW CENTERS (0-BASED, COMMA SEPARATED)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(self.pyfai_notebook_box, textvariable=self.pyfai_notebook_gap_var, style="Modern.TEntry").pack(fill="x", pady=(3, 5))
+        ttk.Checkbutton(self.pyfai_notebook_box, text="Notebook Gaussian beam-center fit",
+                        variable=self.pyfai_notebook_fit_var,
+                        style="Modern.TCheckbutton").pack(anchor="w", pady=(0, 5))
+        ttk.Checkbutton(self.pyfai_notebook_box, text="Also apply HDXF detector mask (NOT notebook exact)",
+                        variable=self.pyfai_notebook_extra_detector_mask_var,
+                        style="Modern.TCheckbutton").pack(anchor="w", pady=(0, 5))
+        ttk.Button(self.pyfai_notebook_box, text="Apply Notebook geometry (65 mm / 0.075 mm)",
+                   style="Secondary.TButton", command=self._notebook_apply_geometry).pack(fill="x", pady=(0, 5))
+        ttk.Label(self.pyfai_notebook_box,
+                  text="Uses gap ±35 px + 10 px buffer, saturation >=32765, median hot-spot mask and 3-iteration 3σ ring-MAD. Original notebook resets sigma clips each iteration. For exact comparison load its KDP_average_final.npy; computed all-frame means may differ.",
+                  style="ReadoutMuted.TLabel", wraplength=320, justify="left").pack(fill="x")
+
+        self.pyfai_2d_box = ttk.Frame(integration, style="CardAlt.TFrame", padding=(8, 7))
+        self.pyfai_2d_box.pack(fill="x", pady=(0, 7))
+        self.pyfai_2d_box.columnconfigure(0, weight=1)
+        self.pyfai_2d_box.columnconfigure(1, weight=1)
+        a = ttk.Frame(self.pyfai_2d_box, style="CardAlt.TFrame")
+        b = ttk.Frame(self.pyfai_2d_box, style="CardAlt.TFrame")
+        a.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        b.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Label(a, text="AZIMUTH BINS", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(a, textvariable=self.pyfai_azimuth_bins_var, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+        ttk.Label(b, text="χ RANGE (DEG)", style="FieldLabel.TLabel").pack(anchor="w")
+        chi = ttk.Frame(b, style="CardAlt.TFrame")
+        chi.pack(fill="x", pady=(3, 0))
+        ttk.Entry(chi, textvariable=self.pyfai_azimuth_min_var, width=7, style="Modern.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Label(chi, text="to", style="ReadoutMuted.TLabel").pack(side="left", padx=4)
+        ttk.Entry(chi, textvariable=self.pyfai_azimuth_max_var, width=7, style="Modern.TEntry").pack(side="left", fill="x", expand=True)
+
+        corr = ttk.Frame(integration, style="Card.TFrame")
+        corr.pack(fill="x", pady=(0, 7))
+        ttk.Checkbutton(corr, text="Detector mask", variable=self.pyfai_use_detector_mask_var, style="Modern.TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(corr, text="Only current ROI", variable=self.pyfai_use_roi_var, style="Modern.TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(corr, text="Solid-angle correction", variable=self.pyfai_solid_angle_var, style="Modern.TCheckbutton").pack(anchor="w")
+        pol = ttk.Frame(integration, style="Card.TFrame")
+        pol.pack(fill="x", pady=(0, 7))
+        ttk.Label(pol, text="POLARIZATION (-1…1, BLANK = NONE)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(pol, textvariable=self.pyfai_polarization_var, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+
+        self.pyfai_run_button = ttk.Button(
+            integration,
+            text="Run 1D All-Frame Average",
+            style="Accent.TButton",
+            command=self._run_pyfai_current_frame,
+        )
+        self.pyfai_run_button.pack(fill="x")
+
+        result = self._make_card(parent, "Result", "Results open in a dedicated plot/cake window and can be exported without changing detector data.")
+        ttk.Label(result, textvariable=self.pyfai_status_var, style="ReadoutValue.TLabel", wraplength=330, justify="left").pack(fill="x", pady=(0, 7))
+        result_row = ttk.Frame(result, style="Card.TFrame")
+        result_row.pack(fill="x")
+        self.pyfai_show_result_button = ttk.Button(result_row, text="Show Result", style="Secondary.TButton", command=self._show_pyfai_result_window)
+        self.pyfai_show_result_button.pack(side="left", fill="x", expand=True)
+        self.pyfai_export_button = ttk.Button(result_row, text="Export…", style="Secondary.TButton", command=self._export_pyfai_result)
+        self.pyfai_export_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._pyfai_mode_changed()
+
+    def _pyfai_reload_view_geometry(self) -> None:
+        """Drop any PONI/refinement override and reload geometry from active data."""
+        self._pyfai_loaded_detector = None
+        self._pyfai_geometry_override_source = None
+        self.pyfai_poni_file_var.set("No PONI file loaded")
+        self._pyfai_ai_cache.clear()
+        self._refresh_pyfai_sidebar(force_geometry=True)
+
+    def _pyfai_apply_ai_to_ui(self, ai: Any, *, source_label: str) -> None:
+        """Populate editable geometry fields from a pyFAI geometry object."""
+        detector = getattr(ai, "detector", None)
+        pixel_y = getattr(detector, "pixel1", None) if detector is not None else None
+        pixel_x = getattr(detector, "pixel2", None) if detector is not None else None
+        if pixel_y is None:
+            pixel_y = getattr(ai, "pixel1", None)
+        if pixel_x is None:
+            pixel_x = getattr(ai, "pixel2", None)
+        dist = getattr(ai, "dist", None)
+        poni1 = getattr(ai, "poni1", None)
+        poni2 = getattr(ai, "poni2", None)
+        rot1 = getattr(ai, "rot1", 0.0) or 0.0
+        rot2 = getattr(ai, "rot2", 0.0) or 0.0
+        rot3 = getattr(ai, "rot3", 0.0) or 0.0
+        wavelength = getattr(ai, "wavelength", None)
+        required = (dist, poni1, poni2, pixel_x, pixel_y)
+        if any(value is None for value in required):
+            raise HDXFViewerError("PONI geometry is missing distance, PONI or detector pixel size")
+        dist = float(dist)
+        poni1 = float(poni1)
+        poni2 = float(poni2)
+        pixel_x = float(pixel_x)
+        pixel_y = float(pixel_y)
+        if dist <= 0.0 or pixel_x <= 0.0 or pixel_y <= 0.0:
+            raise HDXFViewerError("PONI geometry contains non-positive distance/pixel size")
+        self.pyfai_distance_var.set(f"{dist:.12g}")
+        self.pyfai_pixel_x_var.set(f"{pixel_x:.12g}")
+        self.pyfai_pixel_y_var.set(f"{pixel_y:.12g}")
+        if wavelength is not None and float(wavelength) > 0.0:
+            self.pyfai_wavelength_var.set(f"{float(wavelength) * 1e10:.12g}")
+        # These are the PONI coordinates represented in pixel units. For a
+        # non-tilted detector they coincide with the familiar beam-center pixel.
+        self.pyfai_beam_x_var.set(f"{poni2 / pixel_x - 0.5:.12g}")
+        self.pyfai_beam_y_var.set(f"{poni1 / pixel_y - 0.5:.12g}")
+        self.pyfai_rot1_var.set(f"{math.degrees(float(rot1)):.12g}")
+        self.pyfai_rot2_var.set(f"{math.degrees(float(rot2)):.12g}")
+        self.pyfai_rot3_var.set(f"{math.degrees(float(rot3)):.12g}")
+        self._pyfai_loaded_detector = detector
+        self._pyfai_geometry_override_source = source_label
+        self.pyfai_geometry_source_var.set(source_label)
+        view = self.active_view
+        if view is not None and view.archive is not None:
+            self._pyfai_geometry_context = (
+                id(view), str(view.archive.path), int(view.current_frame_index),
+                tuple(view.canvas.manual_beam_center) if view.canvas.manual_beam_center is not None else None,
+            )
+        self._pyfai_ai_cache.clear()
+
+    def _load_pyfai_poni(self) -> None:
+        if not PYFAI_AVAILABLE or pyFAI is None:
+            messagebox.showerror("pyFAI", "pyFAI is not installed.", parent=self.root)
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load pyFAI PONI geometry",
+            filetypes=[("pyFAI PONI", "*.poni"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            ai = pyFAI.load(path)
+            self._pyfai_apply_ai_to_ui(ai, source_label=f"Loaded PONI · {Path(path).name}")
+            self.pyfai_poni_file_var.set(str(Path(path).name))
+            self.pyfai_status_var.set(f"PONI loaded · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Load PONI", f"Cannot load PONI:\n{type(exc).__name__}: {exc}", parent=self.root)
+
+    def _save_pyfai_poni(self) -> None:
+        if not PYFAI_AVAILABLE:
+            messagebox.showerror("pyFAI", "pyFAI is not installed.", parent=self.root)
+            return
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showinfo("Save PONI", "Open a detector frame first.", parent=self.root)
+            return
+        try:
+            config = self._pyfai_config_from_ui(view)
+            ai = self._pyfai_integrator_for_config(config)
+        except Exception as exc:
+            messagebox.showerror("Save PONI", str(exc), parent=self.root)
+            return
+        initial = f"{Path(view.archive.path).stem}.poni"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save pyFAI PONI geometry",
+            defaultextension=".poni",
+            initialfile=initial,
+            filetypes=[("pyFAI PONI", "*.poni"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            saver = getattr(ai, "save", None)
+            if callable(saver):
+                saver(path)
+            elif PyFAIPoniFile is not None:
+                poni = PyFAIPoniFile(data=ai)
+                with open(path, "w", encoding="utf-8") as handle:
+                    poni.write(handle)
+            else:
+                raise HDXFViewerError("Installed pyFAI does not expose a PONI writer")
+            self.pyfai_poni_file_var.set(Path(path).name)
+            self.pyfai_status_var.set(f"PONI saved · {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Save PONI", f"Cannot save PONI:\n{type(exc).__name__}: {exc}", parent=self.root)
+
+    def _pyfai_calibration_context_for_view(self, view: InternalViewState) -> tuple[Any, ...]:
+        archive_path = str(view.archive.path) if view.archive is not None else ""
+        return (id(view), archive_path, int(view.current_frame_index))
+
+    def _pyfai_pick_mode_changed(self) -> None:
+        if self.pyfai_pick_points_var.get():
+            self.pyfai_status_var.set("Calibration point picking armed · Shift+left-click the selected powder ring")
+        else:
+            self.pyfai_status_var.set("Calibration point picking off")
+
+    def _pyfai_update_calibration_status(self) -> None:
+        if not self._pyfai_calibration_points:
+            self.pyfai_calibration_status_var.set("No calibration points")
+            return
+        counts = Counter(ring for _x, _y, ring in self._pyfai_calibration_points)
+        ring_text = ", ".join(f"R{ring}: {counts[ring]}" for ring in sorted(counts))
+        self.pyfai_calibration_status_var.set(
+            f"{len(self._pyfai_calibration_points)} point(s) · {ring_text}"
+        )
+
+    def _pyfai_sync_calibration_overlay(self) -> None:
+        show = self.sidebar_page_var.get() == "pyfai"
+        for view in getattr(self, "views", []):
+            if show and view is self.active_view and self._pyfai_calibration_points:
+                view.canvas.set_calibration_points(self._pyfai_calibration_points)
+            else:
+                view.canvas.set_calibration_points([])
+
+    def _pyfai_add_calibration_point(self, view: InternalViewState, pixel: tuple[int, int]) -> bool:
+        if self.sidebar_page_var.get() != "pyfai" or not self.pyfai_pick_points_var.get():
+            return False
+        self.activate_view(view, refresh=False)
+        try:
+            ring = int(self.pyfai_ring_index_var.get().strip())
+        except ValueError:
+            messagebox.showerror("pyFAI calibration", "Ring index must be an integer.", parent=self.root)
+            return True
+        if ring < 0:
+            messagebox.showerror("pyFAI calibration", "Ring index must be 0 or greater.", parent=self.root)
+            return True
+        context = self._pyfai_calibration_context_for_view(view)
+        if self._pyfai_calibration_context != context:
+            self._pyfai_calibration_context = context
+            self._pyfai_calibration_points.clear()
+        x, y = (int(pixel[0]), int(pixel[1]))
+        point = (x, y, ring)
+        if point not in self._pyfai_calibration_points:
+            self._pyfai_calibration_points.append(point)
+        self._pyfai_update_calibration_status()
+        self._pyfai_sync_calibration_overlay()
+        self.pyfai_status_var.set(f"Calibration point added · R{ring} · X={x}, Y={y}")
+        return True
+
+    def _pyfai_undo_calibration_point(self) -> None:
+        if self._pyfai_calibration_points:
+            self._pyfai_calibration_points.pop()
+        self._pyfai_update_calibration_status()
+        self._pyfai_sync_calibration_overlay()
+
+    def _pyfai_clear_calibration_points(self) -> None:
+        self._pyfai_calibration_points.clear()
+        self._pyfai_calibration_context = None
+        self._pyfai_update_calibration_status()
+        self._pyfai_sync_calibration_overlay()
+        self.pyfai_status_var.set("Calibration points cleared")
+
+    def _refine_pyfai_geometry(self) -> None:
+        if not PYFAI_AVAILABLE or PyFAIGeometryRefinement is None or pyfai_get_calibrant is None:
+            messagebox.showerror("pyFAI refinement", "Geometry refinement is unavailable in this pyFAI installation.", parent=self.root)
+            return
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showinfo("pyFAI refinement", "Open a detector frame first.", parent=self.root)
+            return
+        context = self._pyfai_calibration_context_for_view(view)
+        if self._pyfai_calibration_context != context or len(self._pyfai_calibration_points) < 6:
+            messagebox.showinfo(
+                "pyFAI refinement",
+                "Pick at least 6 control points on the current image first.\n\n"
+                "Select a ring index, enable point picking, then Shift+left-click points on the ring.",
+                parent=self.root,
+            )
+            return
+        unique_rings = {ring for _x, _y, ring in self._pyfai_calibration_points}
+        mode = self.pyfai_refine_mode_var.get().strip()
+        if mode != "Beam center only" and len(unique_rings) < 2:
+            messagebox.showinfo(
+                "pyFAI refinement",
+                "Beam-center + distance/full refinement needs points from at least 2 ring indices.",
+                parent=self.root,
+            )
+            return
+        try:
+            config = self._pyfai_config_from_ui(view)
+            calibrant_name = self.pyfai_calibrant_var.get().strip()
+            calibrant = pyfai_get_calibrant(calibrant_name)
+            calibrant.wavelength = float(config["wavelength_m"])
+            data = np.asarray(
+                [[float(y), float(x), float(ring)] for x, y, ring in self._pyfai_calibration_points],
+                dtype=np.float64,
+            )
+            detector = self._pyfai_detector_for_config(config)
+            gr = PyFAIGeometryRefinement(
+                data=data,
+                calibrant=calibrant,
+                dist=float(config["distance_m"]),
+                poni1=float(config["poni1"]),
+                poni2=float(config["poni2"]),
+                rot1=float(config["rot1"]),
+                rot2=float(config["rot2"]),
+                rot3=float(config["rot3"]),
+                detector=detector,
+                wavelength=float(config["wavelength_m"]),
+            )
+            if mode == "Beam center only":
+                fixed = ["dist", "rot1", "rot2", "rot3", "wavelength"]
+            elif mode == "Full geometry":
+                fixed = ["wavelength"]
+            else:
+                fixed = ["rot1", "rot2", "rot3", "wavelength"]
+            self.pyfai_status_var.set("Refining geometry from control points…")
+            self.root.update_idletasks()
+            refine = getattr(gr, "refine3", None) or getattr(gr, "refine2", None)
+            if not callable(refine):
+                raise HDXFViewerError("Installed pyFAI GeometryRefinement has no refine2/refine3 method")
+            refine(maxiter=200000, fix=fixed)
+            chi2 = float(gr.chi2())
+            self._pyfai_apply_ai_to_ui(
+                gr,
+                source_label=f"Refined · {calibrant_name} · χ²={chi2:.4g}",
+            )
+            self.pyfai_status_var.set(
+                f"Geometry refined · {len(self._pyfai_calibration_points)} points · "
+                f"{len(unique_rings)} ring(s) · χ²={chi2:.5g}"
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "pyFAI refinement",
+                f"Refinement failed:\n{type(exc).__name__}: {exc}\n\n"
+                "Check calibrant, ring indices and the initial geometry.",
+                parent=self.root,
+            )
+            self.pyfai_status_var.set("Geometry refinement failed")
+
+    def _notebook_apply_geometry(self) -> None:
+        self.pyfai_distance_var.set("0.065")
+        self.pyfai_pixel_x_var.set("0.000075")
+        self.pyfai_pixel_y_var.set("0.000075")
+        for angle in (self.pyfai_rot1_var, self.pyfai_rot2_var, self.pyfai_rot3_var):
+            angle.set("0")
+
+    def _notebook_pick_npy(self) -> None:
+        path = filedialog.askopenfilename(parent=self.root,
+                                          title="Choose Notebook averaged detector image",
+                                          filetypes=[("NumPy image", "*.npy"), ("All files", "*.*")])
+        if path:
+            self.pyfai_notebook_npy_var.set(path)
+            self.pyfai_notebook_source_var.set("Reference .npy")
+
+    def _pyfai_mode_changed(self) -> None:
+        if not hasattr(self, "pyfai_2d_box"):
+            return
+        mode_label = self.pyfai_mode_var.get()
+        is_2d = mode_label.startswith("2D")
+        is_notebook = mode_label.startswith("1D Notebook")
+        self.pyfai_2d_box.pack_forget()
+        self.pyfai_1d_average_box.pack_forget()
+        self.pyfai_notebook_box.pack_forget()
+        if is_2d:
+            self.pyfai_2d_box.pack(fill="x", pady=(0, 7))
+        elif is_notebook:
+            self.pyfai_notebook_box.pack(fill="x", pady=(0, 7), before=self.pyfai_run_button)
+        else:
+            self.pyfai_1d_average_box.pack(fill="x", pady=(0, 7), before=self.pyfai_run_button)
+        if hasattr(self, "pyfai_unit_combo"):
+            self.pyfai_unit_combo.configure(state="readonly" if is_2d else "disabled")
+        if hasattr(self, "pyfai_run_button"):
+            self.pyfai_run_button.configure(text=(
+                "Run pyFAI on Current Frame" if is_2d else
+                "Run Notebook Reference 1D" if is_notebook else
+                "Run 1D All-Frame pyFAI Average"))
+        self._pyfai_update_average_group_label()
+        self._refresh_pyfai_sidebar()
+        self.root.after_idle(self._on_sidebar_content_configure)
+
+    def _pyfai_average_group_size(self, *, strict: bool = True) -> int | None:
+        token = self.pyfai_1d_average_size_var.get().strip() if hasattr(self, "pyfai_1d_average_size_var") else "500"
+        try:
+            value = int(token)
+        except ValueError:
+            if strict:
+                raise HDXFViewerError("Frames / calculation block must be an integer")
+            return None
+        if value < 1:
+            if strict:
+                raise HDXFViewerError("Frames / calculation block must be at least 1")
+            return None
+        return value
+
+    @staticmethod
+    def _pyfai_average_group_bounds(frame_index: int, frame_count: int, group_size: int) -> tuple[int, int, int, int]:
+        """Return start, stop(exclusive), zero-based group index and group count."""
+        count = max(0, int(frame_count))
+        if count <= 0:
+            return 0, 0, 0, 0
+        size = max(1, int(group_size))
+        index = max(0, min(count - 1, int(frame_index)))
+        group_index = index // size
+        start = group_index * size
+        stop = min(count, start + size)
+        group_count = (count + size - 1) // size
+        return start, stop, group_index, group_count
+
+    def _pyfai_update_average_group_label(self) -> None:
+        if not hasattr(self, "pyfai_1d_average_group_var"):
+            return
+        view = self.active_view
+        if view is None or view.archive is None:
+            self.pyfai_1d_average_group_var.set("All-frame average: —")
+            return
+        size = self._pyfai_average_group_size(strict=False)
+        if size is None:
+            self.pyfai_1d_average_group_var.set("Frames / calculation block must be a positive integer")
+            return
+        frame_count = max(0, int(view.archive.frame_count))
+        block_count = (frame_count + size - 1) // size if frame_count else 0
+        self.pyfai_1d_average_group_var.set(
+            f"All {frame_count} frames → 1 averaged 1D curve · {block_count} calculation block"
+            f"{'s' if block_count != 1 else ''} of up to {size} frames"
+        )
+
+    def _pyfai_step_average_group(self, delta: int) -> None:
+        view = self.active_view
+        if view is None or view.archive is None:
+            return
+        try:
+            size = self._pyfai_average_group_size(strict=True)
+        except Exception as exc:
+            messagebox.showerror("pyFAI 1D averaging", str(exc), parent=self.root)
+            return
+        start, _stop, group_index, group_count = self._pyfai_average_group_bounds(
+            view.current_frame_index, view.archive.frame_count, size
+        )
+        target_group = max(0, min(group_count - 1, group_index + int(delta)))
+        target_frame = min(view.archive.frame_count - 1, target_group * size)
+        if target_frame == view.current_frame_index:
+            self._pyfai_update_average_group_label()
+            return
+        self.load_frame_for_view(view, target_frame, recompute_contrast=False, playback=False)
+        self._refresh_pyfai_sidebar()
+        self._pyfai_update_average_group_label()
+
+    def _pyfai_beam_center_for_view(self, view: InternalViewState) -> tuple[float | None, float | None, str]:
+        if view.canvas.manual_beam_center is not None:
+            x, y = view.canvas.manual_beam_center
+            return float(x), float(y), "Viewer Beam Center (Ctrl+left-click)"
+        archive = view.archive
+        if archive is None:
+            return None, None, "Beam Center missing"
+        try:
+            bx, _ = archive.find_hdf5_value(
+                ("/entry/instrument/detector/beam_center_x", "/entry/instrument/detector/beam_centre_x"),
+                suffixes=("/beam_center_x", "/beam_centre_x"),
+            )
+            by, _ = archive.find_hdf5_value(
+                ("/entry/instrument/detector/beam_center_y", "/entry/instrument/detector/beam_centre_y"),
+                suffixes=("/beam_center_y", "/beam_centre_y"),
+            )
+            x = _numeric_scalar(bx, index=view.current_frame_index) if bx is not None else None
+            y = _numeric_scalar(by, index=view.current_frame_index) if by is not None else None
+            if x is not None and y is not None:
+                return float(x), float(y), "HDF5/HDXF Beam Center metadata"
+        except Exception:
+            pass
+        return None, None, "Beam Center missing — Ctrl+left-click image"
+
+    def _refresh_pyfai_sidebar(self, *, force_geometry: bool = False) -> None:
+        if not hasattr(self, "pyfai_run_button"):
+            return
+        if force_geometry:
+            self._pyfai_geometry_override_source = None
+            self._pyfai_loaded_detector = None
+            self.pyfai_poni_file_var.set("No PONI file loaded")
+            self._pyfai_ai_cache.clear()
+        view = self.active_view
+        enabled = view is not None and view.archive is not None and view.current_frame is not None
+        if not enabled or view is None or view.archive is None:
+            self.pyfai_view_var.set("No active detector view")
+            self.pyfai_file_var.set("Open an HDXF or HDF5 file")
+            self.pyfai_frame_var.set("—")
+            self.pyfai_status_var.set("Select a detector view to configure integration.")
+            self.pyfai_run_button.configure(state="disabled")
+            self.pyfai_show_result_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+            self.pyfai_export_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+            return
+        self.pyfai_view_var.set(f"VIEW {view.view_id:02d} · {getattr(view.archive, 'file_format', 'DATA')}")
+        self.pyfai_file_var.set(view.archive.path.name)
+        edited = " · EDITED" if view.current_frame_index in view.edited_frame_files else ""
+        self.pyfai_frame_var.set(f"{view.current_frame_index + 1} / {view.archive.frame_count}{edited}")
+        self._pyfai_update_average_group_label()
+        self.pyfai_package_var.set(f"pyFAI {PYFAI_VERSION}")
+        self.pyfai_run_button.configure(state="normal" if (PYFAI_AVAILABLE or self.pyfai_mode_var.get().startswith("1D Notebook")) else "disabled")
+        self.pyfai_show_result_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+        self.pyfai_export_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+
+        context = (
+            id(view),
+            str(view.archive.path),
+            int(view.current_frame_index),
+            tuple(view.canvas.manual_beam_center) if view.canvas.manual_beam_center is not None else None,
+        )
+        previous_context = self._pyfai_geometry_context
+        if (
+            self._pyfai_geometry_override_source is not None
+            and previous_context is not None
+            and previous_context[:2] != context[:2]
+        ):
+            # A loaded/refined geometry is kept while browsing frames in the same
+            # View, but never leaks automatically into a different detector file.
+            self._pyfai_geometry_override_source = None
+            self._pyfai_loaded_detector = None
+            self.pyfai_poni_file_var.set("No PONI file loaded")
+            self._pyfai_ai_cache.clear()
+        should_autofill = force_geometry or (
+            context != self._pyfai_geometry_context
+            and self._pyfai_geometry_override_source is None
+        )
+        if should_autofill:
+            self._pyfai_geometry_context = context
+            geometry = self._resolution_geometry_for_view(view)
+            bx, by, beam_source = self._pyfai_beam_center_for_view(view)
+            if geometry is not None:
+                self.pyfai_distance_var.set(f"{geometry['distance_m']:.12g}")
+                self.pyfai_pixel_x_var.set(f"{geometry['pixel_size_x_m']:.12g}")
+                self.pyfai_pixel_y_var.set(f"{geometry['pixel_size_y_m']:.12g}")
+                self.pyfai_wavelength_var.set(f"{geometry['wavelength_angstrom']:.12g}")
+            elif force_geometry:
+                self.pyfai_distance_var.set("")
+                self.pyfai_pixel_x_var.set("")
+                self.pyfai_pixel_y_var.set("")
+                self.pyfai_wavelength_var.set("")
+            if bx is not None and by is not None:
+                self.pyfai_beam_x_var.set(f"{bx:.12g}")
+                self.pyfai_beam_y_var.set(f"{by:.12g}")
+            elif force_geometry:
+                self.pyfai_beam_x_var.set("")
+                self.pyfai_beam_y_var.set("")
+            geometry_source = "Geometry from HDF5/HDXF" if geometry is not None else "Geometry incomplete"
+            self.pyfai_geometry_source_var.set(f"{geometry_source} · {beam_source}")
+        elif context != self._pyfai_geometry_context:
+            # Keep a user-loaded/refined PONI geometry stable across frames in
+            # the same View while still tracking the active frame context.
+            self._pyfai_geometry_context = context
+
+        cal_context = self._pyfai_calibration_context_for_view(view)
+        if self._pyfai_calibration_context is not None and self._pyfai_calibration_context != cal_context:
+            self._pyfai_calibration_points.clear()
+            self._pyfai_calibration_context = None
+            self._pyfai_update_calibration_status()
+            self._pyfai_sync_calibration_overlay()
+
+        if not PYFAI_AVAILABLE:
+            detail = f" ({PYFAI_IMPORT_ERROR})" if PYFAI_IMPORT_ERROR else ""
+            self.pyfai_status_var.set(f"pyFAI is not installed. Run: python -m pip install pyFAI{detail}")
+        elif self._pyfai_worker is not None and self._pyfai_worker.is_alive():
+            # Keep the progress text emitted by the running worker when possible.
+            if not self.pyfai_status_var.get().startswith("Averaging pyFAI 1D"):
+                self.pyfai_status_var.set("Integrating current frame…")
+        elif self._pyfai_result is None:
+            self.pyfai_status_var.set("Ready · verify geometry, then run 1D or 2D integration.")
+
+    @staticmethod
+    def _pyfai_parse_float(text: str, label: str, *, positive: bool = False) -> float:
+        try:
+            value = float(str(text).strip())
+        except ValueError as exc:
+            raise HDXFViewerError(f"{label} must be a number") from exc
+        if not math.isfinite(value) or (positive and value <= 0.0):
+            qualifier = "positive and finite" if positive else "finite"
+            raise HDXFViewerError(f"{label} must be {qualifier}")
+        return value
+
+    @staticmethod
+    def _pyfai_theta_from_radius_distance(
+        radius_m: np.ndarray | float,
+        distance_m: float,
+    ) -> np.ndarray:
+        """Return the custom 1D Bragg-angle x-axis in radians.
+
+        The detector workflow defines
+
+            R = sqrt(((x-x0)*pixel_x)^2 + ((y-y0)*pixel_y)^2)
+            theta = 0.5 * atan(R / L)
+
+        where R is the detector-plane radial distance and L is the
+        sample-to-detector distance. R and L must use the same length unit;
+        this implementation uses metres.
+        """
+        radius = np.asarray(radius_m, dtype=np.float64)
+        distance = float(distance_m)
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise HDXFViewerError("Distance must be positive and finite for the custom 1D θ axis")
+        return 0.5 * np.arctan(radius / distance)
+
+    def _pyfai_detector_mask_for_view(self, view: InternalViewState, shape: tuple[int, int]) -> np.ndarray | None:
+        archive = view.archive
+        if archive is None:
+            return None
+        try:
+            value, _path = archive.find_hdf5_value(
+                (
+                    "/entry/instrument/detector/detectorSpecific/pixel_mask",
+                    "/entry/instrument/detector/pixel_mask",
+                ),
+                suffixes=("/pixel_mask",),
+            )
+        except Exception:
+            return None
+        if value is None:
+            return None
+        array = np.asarray(value)
+        if array.shape != shape:
+            if array.size == int(np.prod(shape, dtype=np.int64)):
+                array = array.reshape(shape)
+            else:
+                raise HDXFViewerError(f"Detector mask shape {array.shape} does not match frame {shape}")
+        return np.asarray(array != 0, dtype=bool)
+
+    def _pyfai_combined_mask(self, view: InternalViewState, frame: np.ndarray) -> np.ndarray | None:
+        shape = tuple(int(v) for v in frame.shape)
+        mask = np.zeros(shape, dtype=bool)
+        used = False
+        if self.pyfai_use_detector_mask_var.get():
+            detector_mask = self._pyfai_detector_mask_for_view(view, shape)
+            if detector_mask is not None:
+                mask |= detector_mask
+                used = True
+        if frame.dtype.kind == "f":
+            invalid = ~np.isfinite(frame)
+            if np.any(invalid):
+                mask |= invalid
+                used = True
+        if self.pyfai_use_roi_var.get():
+            roi = view.canvas.get_roi()
+            local = view.canvas.roi_mask()
+            if roi is None or local is None:
+                raise HDXFViewerError("Draw an ROI first or disable 'Only current ROI'.")
+            x, y, width, height = roi
+            roi_keep = np.zeros(shape, dtype=bool)
+            roi_keep[y:y + height, x:x + width] = np.asarray(local, dtype=bool)
+            mask |= ~roi_keep
+            used = True
+        return np.ascontiguousarray(mask) if used else None
+
+    def _pyfai_config_from_ui(self, view: InternalViewState) -> dict[str, Any]:
+        frame = view.current_frame
+        if frame is None or frame.ndim != 2:
+            raise HDXFViewerError("pyFAI requires one current 2D detector frame")
+        distance = self._pyfai_parse_float(self.pyfai_distance_var.get(), "Distance", positive=True)
+        pixel_x = self._pyfai_parse_float(self.pyfai_pixel_x_var.get(), "Pixel X", positive=True)
+        pixel_y = self._pyfai_parse_float(self.pyfai_pixel_y_var.get(), "Pixel Y", positive=True)
+        wavelength_a = self._pyfai_parse_float(self.pyfai_wavelength_var.get(), "Wavelength", positive=True)
+        beam_x = self._pyfai_parse_float(self.pyfai_beam_x_var.get(), "Beam X")
+        beam_y = self._pyfai_parse_float(self.pyfai_beam_y_var.get(), "Beam Y")
+        rot1 = math.radians(self._pyfai_parse_float(self.pyfai_rot1_var.get(), "Rot1"))
+        rot2 = math.radians(self._pyfai_parse_float(self.pyfai_rot2_var.get(), "Rot2"))
+        rot3 = math.radians(self._pyfai_parse_float(self.pyfai_rot3_var.get(), "Rot3"))
+        try:
+            radial_bins = int(self.pyfai_radial_bins_var.get().strip())
+        except ValueError as exc:
+            raise HDXFViewerError("Radial bins must be an integer") from exc
+        if not 16 <= radial_bins <= 20000:
+            raise HDXFViewerError("Radial bins must be within 16..20000")
+        mode = "2d" if self.pyfai_mode_var.get().startswith("2D") else "1d"
+        azimuth_bins = 360
+        if mode == "2d":
+            try:
+                azimuth_bins = int(self.pyfai_azimuth_bins_var.get().strip())
+            except ValueError as exc:
+                raise HDXFViewerError("Azimuth bins must be an integer") from exc
+            if not 8 <= azimuth_bins <= 4096:
+                raise HDXFViewerError("Azimuth bins must be within 8..4096")
+        chi_min = self._pyfai_parse_float(self.pyfai_azimuth_min_var.get(), "Azimuth minimum")
+        chi_max = self._pyfai_parse_float(self.pyfai_azimuth_max_var.get(), "Azimuth maximum")
+        if chi_max <= chi_min:
+            raise HDXFViewerError("Azimuth maximum must be greater than minimum")
+        polarization: float | None = None
+        token = self.pyfai_polarization_var.get().strip()
+        if token:
+            polarization = self._pyfai_parse_float(token, "Polarization")
+            if not -1.0 <= polarization <= 1.0:
+                raise HDXFViewerError("Polarization must be within -1..1")
+        unit = self.pyfai_unit_var.get().strip() or "q_A^-1"
+        # 1D is integrated in detector radius (mm), then converted to the
+        # requested Bragg-angle axis theta = 0.5*atan(R/L), with R and L in
+        # the same physical length unit. 2D keeps the selected pyFAI unit.
+        integration_unit = "r_mm" if mode == "1d" else unit
+        # Viewer Beam Center is stored as a 0-based pixel index. pyFAI's PONI
+        # coordinate references pixel edges, so the selected pixel centre is +0.5.
+        poni1 = (beam_y + 0.5) * pixel_y
+        poni2 = (beam_x + 0.5) * pixel_x
+        return {
+            "mode": mode,
+            "distance_m": distance,
+            "pixel_x_m": pixel_x,
+            "pixel_y_m": pixel_y,
+            "wavelength_m": wavelength_a * 1e-10,
+            "wavelength_angstrom": wavelength_a,
+            "beam_x_px": beam_x,
+            "beam_y_px": beam_y,
+            "poni1": poni1,
+            "poni2": poni2,
+            "rot1": rot1,
+            "rot2": rot2,
+            "rot3": rot3,
+            "radial_bins": radial_bins,
+            "azimuth_bins": azimuth_bins,
+            "azimuth_range": (chi_min, chi_max),
+            "unit": unit,
+            "integration_unit": integration_unit,
+            "one_d_axis": "theta_custom_rad",
+            "correct_solid_angle": bool(self.pyfai_solid_angle_var.get()),
+            "polarization_factor": polarization,
+            "shape": tuple(int(v) for v in frame.shape),
+        }
+
+    def _pyfai_detector_for_config(self, config: dict[str, Any]) -> Any:
+        if not PYFAI_AVAILABLE or PyFAIDetector is None:
+            raise HDXFViewerError("pyFAI detector support is unavailable")
+        loaded = self._pyfai_loaded_detector
+        if loaded is not None:
+            try:
+                p1 = float(getattr(loaded, "pixel1"))
+                p2 = float(getattr(loaded, "pixel2"))
+                shape = tuple(int(v) for v in config["shape"])
+                max_shape = getattr(loaded, "max_shape", None)
+                shape_ok = max_shape is None or tuple(int(v) for v in max_shape) == shape
+                if (
+                    shape_ok
+                    and math.isclose(p1, float(config["pixel_y_m"]), rel_tol=1e-10, abs_tol=1e-15)
+                    and math.isclose(p2, float(config["pixel_x_m"]), rel_tol=1e-10, abs_tol=1e-15)
+                ):
+                    return loaded
+            except Exception:
+                pass
+        return PyFAIDetector(
+            pixel1=float(config["pixel_y_m"]),
+            pixel2=float(config["pixel_x_m"]),
+            max_shape=tuple(config["shape"]),
+        )
+
+    def _pyfai_integrator_for_config(self, config: dict[str, Any]) -> Any:
+        if not PYFAI_AVAILABLE or PyFAIDetector is None or PyFAIAzimuthalIntegrator is None:
+            raise HDXFViewerError("pyFAI is unavailable")
+        detector = self._pyfai_detector_for_config(config)
+        key = (
+            config["shape"], config["distance_m"], config["pixel_x_m"], config["pixel_y_m"],
+            config["wavelength_m"], config["poni1"], config["poni2"],
+            config["rot1"], config["rot2"], config["rot3"], id(detector),
+        )
+        cached = self._pyfai_ai_cache.get(key)
+        if cached is not None:
+            return cached
+        ai = PyFAIAzimuthalIntegrator(
+            dist=float(config["distance_m"]),
+            poni1=float(config["poni1"]),
+            poni2=float(config["poni2"]),
+            rot1=float(config["rot1"]),
+            rot2=float(config["rot2"]),
+            rot3=float(config["rot3"]),
+            detector=detector,
+            wavelength=float(config["wavelength_m"]),
+        )
+        if len(self._pyfai_ai_cache) >= 6:
+            self._pyfai_ai_cache.pop(next(iter(self._pyfai_ai_cache)))
+        self._pyfai_ai_cache[key] = ai
+        return ai
+
+    @staticmethod
+    def _pyfai_online_mean_update(
+        running_mean: np.ndarray | None,
+        running_count: np.ndarray | None,
+        intensity: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Update a per-bin online mean without ever accumulating a large intensity sum."""
+        values = np.asarray(intensity, dtype=np.float64)
+        if running_mean is None or running_count is None:
+            running_mean = np.zeros(values.shape, dtype=np.float64)
+            running_count = np.zeros(values.shape, dtype=np.int64)
+        if running_mean.shape != values.shape:
+            raise HDXFViewerError(
+                f"pyFAI 1D bin count changed during averaging: {values.shape} != {running_mean.shape}"
+            )
+        finite = np.isfinite(values)
+        if np.any(finite):
+            old_count = running_count[finite]
+            new_count = old_count + 1
+            running_mean[finite] += (values[finite] - running_mean[finite]) / new_count
+            running_count[finite] = new_count
+        return running_mean, running_count
+
+    @staticmethod
+    def _pyfai_merge_weighted_means(
+        global_mean: np.ndarray | None,
+        global_count: np.ndarray | None,
+        block_mean: np.ndarray,
+        block_count: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Merge block means using counts, avoiding sum(block_mean * count) accumulation."""
+        bmean = np.asarray(block_mean, dtype=np.float64)
+        bcount = np.asarray(block_count, dtype=np.int64)
+        if global_mean is None or global_count is None:
+            global_mean = np.zeros(bmean.shape, dtype=np.float64)
+            global_count = np.zeros(bmean.shape, dtype=np.int64)
+        if global_mean.shape != bmean.shape:
+            raise HDXFViewerError(
+                f"pyFAI 1D block bin count changed during averaging: {bmean.shape} != {global_mean.shape}"
+            )
+        valid = (bcount > 0) & np.isfinite(bmean)
+        if np.any(valid):
+            gcount = global_count[valid]
+            bc = bcount[valid]
+            total = gcount + bc
+            # Weighted running-mean merge. This never forms the potentially huge
+            # sum of all frame intensities.
+            global_mean[valid] += (bmean[valid] - global_mean[valid]) * (bc / total)
+            global_count[valid] = total
+        return global_mean, global_count
+
+    @staticmethod
+    def _pyfai_average_intensity_finalize(running_mean: np.ndarray, running_count: np.ndarray) -> np.ndarray:
+        out = np.full(running_mean.shape, np.nan, dtype=np.float64)
+        valid = running_count > 0
+        out[valid] = running_mean[valid]
+        return np.ascontiguousarray(out)
+
+    def _pyfai_static_mask_for_group(self, view: InternalViewState, shape: tuple[int, int]) -> np.ndarray | None:
+        """Capture detector/ROI mask once on the UI thread for a 1D frame group."""
+        mask = np.zeros(shape, dtype=bool)
+        used = False
+        if self.pyfai_use_detector_mask_var.get():
+            detector_mask = self._pyfai_detector_mask_for_view(view, shape)
+            if detector_mask is not None:
+                mask |= detector_mask
+                used = True
+        if self.pyfai_use_roi_var.get():
+            roi = view.canvas.get_roi()
+            local = view.canvas.roi_mask()
+            if roi is None or local is None:
+                raise HDXFViewerError("Draw an ROI first or disable 'Only current ROI'.")
+            x, y, width, height = roi
+            roi_keep = np.zeros(shape, dtype=bool)
+            roi_keep[y:y + height, x:x + width] = np.asarray(local, dtype=bool)
+            mask |= ~roi_keep
+            used = True
+        return np.ascontiguousarray(mask) if used else None
+
+    def _run_notebook_reference(self) -> None:
+        """Match the attached Notebook: integrate one *averaged image* after masks."""
+        if self._pyfai_worker is not None and self._pyfai_worker.is_alive():
+            messagebox.showinfo("Notebook reference", "An integration is already running.", parent=self.root)
+            return
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showinfo("Notebook reference", "Open a detector image first.", parent=self.root)
+            return
+        try:
+            from hdxf_notebook_reference import NotebookOptions, calculate_notebook_reference
+            distance_m = self._pyfai_parse_float(self.pyfai_distance_var.get(), "Distance", positive=True)
+            pixel_x = self._pyfai_parse_float(self.pyfai_pixel_x_var.get(), "Pixel X", positive=True)
+            pixel_y = self._pyfai_parse_float(self.pyfai_pixel_y_var.get(), "Pixel Y", positive=True)
+            if not math.isclose(pixel_x, pixel_y, rel_tol=1e-8):
+                raise HDXFViewerError("Notebook reference requires square pixels (Pixel X = Pixel Y).")
+            for value in (self.pyfai_rot1_var, self.pyfai_rot2_var, self.pyfai_rot3_var):
+                if abs(self._pyfai_parse_float(value.get(), "Rotation")) > 1e-9:
+                    raise HDXFViewerError("Notebook reference assumes zero detector tilt. Use legacy pyFAI mode for tilted geometry.")
+            bin_width = self._pyfai_parse_float(self.pyfai_notebook_bin_var.get(), "Notebook bin width", positive=True)
+            min_radius = self._pyfai_parse_float(self.pyfai_notebook_exclude_var.get(), "Center exclusion")
+            if min_radius < 0:
+                raise HDXFViewerError("Center exclusion must be >=0")
+            gaps = tuple(int(t.strip()) for t in self.pyfai_notebook_gap_var.get().split(",") if t.strip())
+            fit_beam = bool(self.pyfai_notebook_fit_var.get())
+            beam_x = None if fit_beam else self._pyfai_parse_float(self.pyfai_beam_x_var.get(), "Beam X")
+            beam_y = None if fit_beam else self._pyfai_parse_float(self.pyfai_beam_y_var.get(), "Beam Y")
+            options = NotebookOptions(distance_mm=distance_m * 1000., pixel_size_mm=pixel_x * 1000.,
+                                      beam_x=beam_x, beam_y=beam_y, fit_beam=fit_beam,
+                                      bin_width_px=bin_width, exclude_radius_px=min_radius,
+                                      gap_positions=gaps)
+            source_mode = self.pyfai_notebook_source_var.get()
+            npy_path = self.pyfai_notebook_npy_var.get().strip()
+            if source_mode == "Reference .npy" and not Path(npy_path).is_file():
+                raise HDXFViewerError("Choose an existing Notebook averaged .npy image.")
+            original = np.array(view.current_frame, dtype=np.float64, copy=True)
+            shape = tuple(original.shape)
+            use_detector_mask = bool(self.pyfai_notebook_extra_detector_mask_var.get())
+            # For literal Notebook parity, the separate extra mask defaults off.
+            additional_mask = self._pyfai_detector_mask_for_view(view, shape) if use_detector_mask else None
+            edited_paths = {int(i): Path(path) for i, path in view.edited_frame_files.items()}
+            archive_path = Path(view.archive.path)
+            archive_kind = "hdf5" if isinstance(view.archive, HDF5Archive) else "hdxf"
+            frame_count = int(view.archive.frame_count)
+            current_index = int(view.current_frame_index)
+            config = {
+                "mode": "notebook", "one_d_axis": "2th_deg", "unit": "2th_deg",
+                "distance_m": distance_m, "pixel_x_m": pixel_x, "pixel_y_m": pixel_y,
+                "bin_width_px": bin_width, "exclude_radius_px": min_radius,
+                "gap_positions": gaps, "fit_beam": fit_beam, "source_mode": source_mode,
+                "detector_mask_optional": use_detector_mask,
+            }
+        except Exception as exc:
+            messagebox.showerror("Notebook reference parameters", str(exc), parent=self.root)
+            return
+        serial = self._pyfai_run_serial = self._pyfai_run_serial + 1
+        self.pyfai_run_button.configure(state="disabled")
+        self.pyfai_status_var.set(f"Notebook reference · {source_mode} · preparing image...")
+
+        def worker() -> None:
+            reader = None
+            try:
+                if source_mode == "Reference .npy":
+                    image = np.asarray(np.load(npy_path, allow_pickle=False), dtype=np.float64)
+                    averaged = 0  # Precomputed externally: its frame count is unknown.
+                elif source_mode == "Current frame":
+                    image = original
+                    averaged = 1
+                else:
+                    reader = HDF5Archive(archive_path) if archive_kind == "hdf5" else HDXFArchive(archive_path)
+                    image = None
+                    averaged = 0
+                    for i in range(frame_count):
+                        edit = edited_paths.get(i)
+                        if edit is not None and edit.is_file():
+                            frame = np.asarray(np.load(edit, allow_pickle=False), dtype=np.float64)
+                        else:
+                            frame = np.asarray(reader.get_frame(i), dtype=np.float64)
+                        if frame.shape != shape:
+                            raise HDXFViewerError(f"Frame {i+1} shape mismatch {frame.shape} != {shape}")
+                        if image is None:
+                            image = frame.copy()
+                        else:
+                            image += (frame - image) / (averaged + 1)
+                        averaged += 1
+                        if averaged % max(1, min(100, frame_count // 100 or 1)) == 0 or averaged == frame_count:
+                            self._pyfai_queue.put((serial, "progress", {
+                                "done": averaged, "total": frame_count,
+                                "block": averaged, "block_total": frame_count,
+                            }))
+                    if image is None:
+                        raise HDXFViewerError("No frames to average")
+                if image.shape != shape:
+                    raise HDXFViewerError(f"Reference NPY shape {image.shape} != active frame {shape}")
+                calculation = calculate_notebook_reference(image, options, extra_mask=additional_mask)
+                # Do not move full-size masks across the GUI queue. They are
+                # not needed for the 1D plot or CSV export.
+                for key in ("base_mask", "hot_mask", "sigma_mask"):
+                    calculation.pop(key, None)
+                source = {
+                    "filename": (Path(npy_path).name if source_mode == "Reference .npy" else archive_path.name),
+                    "path": (npy_path if source_mode == "Reference .npy" else str(archive_path)),
+                    "frame_index": current_index, "edited": current_index in edited_paths,
+                    "frame_count_averaged": averaged, "calculation_block_size": 0,
+                    "calculation_block_count": 1, "edited_frames_in_average": len(edited_paths),
+                    "average_scope": source_mode,
+                }
+                powder = calculation["sigma_clipped"]
+                payload = {
+                    "kind": "notebook_1d", "profiles": calculation,
+                    "radial": powder["two_theta_deg"], "intensity": powder["intensity"],
+                    "config": config, "source": source,
+                }
+                self._pyfai_queue.put((serial, "done", payload))
+            except Exception as exc:
+                self._pyfai_queue.put((serial, "error", f"{type(exc).__name__}: {exc}"))
+            finally:
+                if reader is not None:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+
+        self._pyfai_worker = threading.Thread(target=worker, name="Notebook-reference-1d", daemon=True)
+        self._pyfai_worker.start()
+        if self._pyfai_poll_after_id is None:
+            self._pyfai_poll_after_id = self.root.after(60, self._poll_pyfai_result)
+
+    def _run_pyfai_current_frame(self) -> None:
+        if self.pyfai_mode_var.get().startswith("1D Notebook"):
+            self._run_notebook_reference()
+            return
+        if not PYFAI_AVAILABLE:
+            messagebox.showerror("pyFAI", "pyFAI is not installed.\n\nRun:\npython -m pip install pyFAI", parent=self.root)
+            return
+        if self._pyfai_worker is not None and self._pyfai_worker.is_alive():
+            messagebox.showinfo("pyFAI", "An integration is already running.", parent=self.root)
+            return
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showinfo("pyFAI", "Open a detector frame first.", parent=self.root)
+            return
+        try:
+            config = self._pyfai_config_from_ui(view)
+            current_frame = np.ascontiguousarray(np.asarray(view.current_frame, dtype=np.float64))
+            if config["mode"] == "2d":
+                mask = self._pyfai_combined_mask(view, current_frame)
+                block_size = 1
+                frame_start = int(view.current_frame_index)
+                frame_stop = frame_start + 1
+                static_mask = None
+            else:
+                block_size = self._pyfai_average_group_size(strict=True)
+                frame_start = 0
+                frame_stop = int(view.archive.frame_count)
+                if frame_stop <= 0:
+                    raise HDXFViewerError("The archive contains no detector frames")
+                static_mask = self._pyfai_static_mask_for_group(view, tuple(int(v) for v in current_frame.shape))
+                mask = None
+        except Exception as exc:
+            messagebox.showerror("pyFAI geometry", str(exc), parent=self.root)
+            return
+
+        archive_path = Path(view.archive.path)
+        archive_kind = "hdf5" if isinstance(view.archive, HDF5Archive) else "hdxf"
+        edited_paths = {int(index): Path(path) for index, path in view.edited_frame_files.items()}
+        total_frames = max(0, frame_stop - frame_start)
+        block_count = (total_frames + block_size - 1) // block_size if total_frames else 0
+        source = {
+            "view_id": int(view.view_id),
+            "filename": view.archive.path.name,
+            "path": str(view.archive.path),
+            "frame_index": int(view.current_frame_index),
+            "edited": bool(view.current_frame_index in view.edited_frame_files),
+            "average_scope": "all-frames" if config["mode"] == "1d" else "current-frame",
+            "frame_start": int(frame_start),
+            "frame_stop": int(frame_stop),
+            "frame_count_averaged": int(total_frames),
+            "calculation_block_size": int(block_size),
+            "calculation_block_count": int(block_count),
+            "edited_frames_in_average": int(sum(1 for idx in edited_paths if frame_start <= idx < frame_stop)),
+        }
+        self._pyfai_run_serial += 1
+        serial = self._pyfai_run_serial
+        self.pyfai_run_button.configure(state="disabled")
+        if config["mode"] == "1d":
+            self.pyfai_status_var.set(
+                f"Averaging all {total_frames} pyFAI 1D profiles · 0/{total_frames} frames · "
+                f"0/{block_count} blocks"
+            )
+        else:
+            self.pyfai_status_var.set("Integrating current frame…")
+
+        def worker() -> None:
+            reader: HDXFArchive | HDF5Archive | None = None
+            try:
+                ai = self._pyfai_integrator_for_config(config)
+                common_base = {
+                    "unit": config["integration_unit"],
+                    "azimuth_range": config["azimuth_range"],
+                    "correctSolidAngle": config["correct_solid_angle"],
+                    "polarization_factor": config["polarization_factor"],
+                }
+                if config["mode"] == "2d":
+                    common = dict(common_base)
+                    common["mask"] = mask
+                    method = getattr(ai, "integrate2d_ng", None) or getattr(ai, "integrate2d")
+                    result = method(current_frame, config["radial_bins"], config["azimuth_bins"], **common)
+                    payload = {
+                        "kind": "2d",
+                        "intensity": np.ascontiguousarray(np.asarray(result.intensity, dtype=np.float64)),
+                        "radial": np.ascontiguousarray(np.asarray(result.radial, dtype=np.float64)),
+                        "azimuthal": np.ascontiguousarray(np.asarray(result.azimuthal, dtype=np.float64)),
+                    }
+                else:
+                    # Independent worker-thread reader. Edited frames are taken
+                    # from their captured temporary .npy files.
+                    reader = HDF5Archive(archive_path) if archive_kind == "hdf5" else HDXFArchive(archive_path)
+                    method = getattr(ai, "integrate1d_ng", None) or getattr(ai, "integrate1d")
+                    reference_r_mm: np.ndarray | None = None
+                    global_mean: np.ndarray | None = None
+                    global_count: np.ndarray | None = None
+                    processed_frames = 0
+
+                    for block_index, block_start in enumerate(range(frame_start, frame_stop, block_size), start=1):
+                        block_stop = min(frame_stop, block_start + block_size)
+                        block_mean: np.ndarray | None = None
+                        block_valid_count: np.ndarray | None = None
+
+                        for frame_index in range(block_start, block_stop):
+                            edited_path = edited_paths.get(int(frame_index))
+                            if edited_path is not None and edited_path.is_file():
+                                frame = np.ascontiguousarray(
+                                    np.asarray(np.load(edited_path, allow_pickle=False), dtype=np.float64)
+                                )
+                            else:
+                                frame = np.ascontiguousarray(
+                                    np.asarray(reader.get_frame(int(frame_index)), dtype=np.float64)
+                                )
+                            if tuple(frame.shape) != tuple(config["shape"]):
+                                raise HDXFViewerError(
+                                    f"Frame {frame_index + 1} shape changed during 1D averaging: "
+                                    f"{frame.shape} != {config['shape']}"
+                                )
+                            frame_mask = None if static_mask is None else np.array(static_mask, copy=True)
+                            if frame.dtype.kind == "f":
+                                invalid = ~np.isfinite(frame)
+                                if np.any(invalid):
+                                    frame_mask = invalid if frame_mask is None else (frame_mask | invalid)
+                            common = dict(common_base)
+                            common["mask"] = np.ascontiguousarray(frame_mask) if frame_mask is not None else None
+                            result = method(frame, config["radial_bins"], **common)
+                            r_mm = np.ascontiguousarray(np.asarray(result.radial, dtype=np.float64))
+                            intensity = np.ascontiguousarray(np.asarray(result.intensity, dtype=np.float64))
+                            if reference_r_mm is None:
+                                reference_r_mm = r_mm
+                            elif r_mm.shape != reference_r_mm.shape or not np.allclose(
+                                r_mm, reference_r_mm, rtol=1e-10, atol=1e-12, equal_nan=True
+                            ):
+                                raise HDXFViewerError(
+                                    "pyFAI radial bins changed between frames. "
+                                    "All-frame averaging requires identical θ bins."
+                                )
+
+                            # Online mean inside the block: no intensity sum is formed.
+                            block_mean, block_valid_count = self._pyfai_online_mean_update(
+                                block_mean, block_valid_count, intensity
+                            )
+                            processed_frames += 1
+
+                        if block_mean is None or block_valid_count is None:
+                            continue
+
+                        # Merge the completed block into the all-frame mean using
+                        # valid-frame counts for each θ bin. Again, no large sum.
+                        global_mean, global_count = self._pyfai_merge_weighted_means(
+                            global_mean, global_count, block_mean, block_valid_count
+                        )
+                        self._pyfai_queue.put((serial, "progress", {
+                            "done": processed_frames,
+                            "total": total_frames,
+                            "block": block_index,
+                            "block_total": block_count,
+                            "block_start": block_start,
+                            "block_stop": block_stop,
+                        }))
+
+                    if reference_r_mm is None or global_mean is None or global_count is None:
+                        raise HDXFViewerError("No frames were integrated for the all-frame 1D average")
+                    radius_m = np.ascontiguousarray(reference_r_mm * 1.0e-3)
+                    theta_rad = np.ascontiguousarray(
+                        self._pyfai_theta_from_radius_distance(radius_m, config["distance_m"])
+                    )
+                    payload = {
+                        "kind": "1d",
+                        "radial": theta_rad,
+                        "radius_m": radius_m,
+                        "pyfai_r_mm": reference_r_mm,
+                        "intensity": self._pyfai_average_intensity_finalize(global_mean, global_count),
+                        "valid_frame_counts_per_bin": np.ascontiguousarray(global_count),
+                    }
+                payload["config"] = dict(config)
+                payload["source"] = source
+                self._pyfai_queue.put((serial, "done", payload))
+            except Exception as exc:
+                self._pyfai_queue.put((serial, "error", f"{type(exc).__name__}: {exc}"))
+            finally:
+                if reader is not None:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+
+        self._pyfai_worker = threading.Thread(target=worker, name="pyFAI-integration", daemon=True)
+        self._pyfai_worker.start()
+        if self._pyfai_poll_after_id is None:
+            self._pyfai_poll_after_id = self.root.after(60, self._poll_pyfai_result)
+
+    def _poll_pyfai_result(self) -> None:
+        self._pyfai_poll_after_id = None
+        handled = False
+        try:
+            while True:
+                serial, kind, payload = self._pyfai_queue.get_nowait()
+                if serial != self._pyfai_run_serial:
+                    continue
+                handled = True
+                if kind == "progress":
+                    done = int(payload.get("done", 0))
+                    total = max(1, int(payload.get("total", 1)))
+                    block = int(payload.get("block", 0))
+                    block_total = max(1, int(payload.get("block_total", 1)))
+                    percent = 100.0 * done / total
+                    self.pyfai_status_var.set(
+                        (f"Notebook reference: averaging image · {done}/{total} frames ({percent:.0f}%)"
+                         if self.pyfai_mode_var.get().startswith("1D Notebook") else
+                         f"Averaging all pyFAI 1D profiles · {done}/{total} frames ({percent:.0f}%) · "
+                         f"block {block}/{block_total}")
+                    )
+                elif kind == "done":
+                    self._pyfai_result = payload
+                    source = payload["source"]
+                    if payload["kind"] == "notebook_1d":
+                        p = payload["profiles"]
+                        self.pyfai_status_var.set(
+                            f"Notebook 1D (2θ degrees) · {source['average_scope']} · "
+                            f"beam ({p['beam_x']:.2f}, {p['beam_y']:.2f}) · "
+                            f"base mask {p['base_mask_count']} px · "
+                            f"hot {p['spot_mask_count']} px · sigma {p['sigma_mask_count']} px"
+                        )
+                    elif payload["kind"] == "1d":
+                        actual = int(source.get("frame_count_averaged", 1))
+                        block_size = int(source.get("calculation_block_size", actual))
+                        blocks = int(source.get("calculation_block_count", 1))
+                        self.pyfai_status_var.set(
+                            f"All-frame 1D average complete · {actual} frames · "
+                            f"{blocks} blocks × up to {block_size} · {payload['radial'].size} θ bins"
+                        )
+                    else:
+                        rows, cols = payload["intensity"].shape
+                        self.pyfai_status_var.set(
+                            f"2D cake complete · {cols} radial × {rows} azimuth bins · image {source['frame_index'] + 1}"
+                        )
+                    self._show_pyfai_result_window()
+                else:
+                    self.pyfai_status_var.set(f"Integration failed · {payload}")
+                    messagebox.showerror("pyFAI integration", str(payload), parent=self.root)
+        except queue.Empty:
+            pass
+        running = self._pyfai_worker is not None and self._pyfai_worker.is_alive()
+        if running and not handled:
+            self._pyfai_poll_after_id = self.root.after(60, self._poll_pyfai_result)
+            return
+        if running:
+            self._pyfai_poll_after_id = self.root.after(60, self._poll_pyfai_result)
+            return
+        if hasattr(self, "pyfai_run_button"):
+            self.pyfai_run_button.configure(state="normal" if (PYFAI_AVAILABLE or self.pyfai_mode_var.get().startswith("1D Notebook")) and self.active_view is not None and self.active_view.archive is not None else "disabled")
+        self._refresh_pyfai_sidebar()
+
+    def _show_pyfai_result_window(self) -> None:
+        if self._pyfai_result is None:
+            return
+        window = self._pyfai_result_window
+        if window is None or not window.winfo_exists():
+            window = tk.Toplevel(self.root)
+            window.title("Integration Result / Notebook Reference")
+            window.geometry("920x620")
+            window.minsize(620, 420)
+            window.configure(background=UI_BG)
+            toolbar = ttk.Frame(window, style="Topbar.TFrame", padding=(10, 8))
+            toolbar.pack(fill="x")
+            ttk.Label(toolbar, text="INTEGRATION RESULT", style="Brand.TLabel").pack(side="left")
+            ttk.Button(toolbar, text="Export…", style="Secondary.TButton", command=self._export_pyfai_result).pack(side="right")
+            canvas = tk.Canvas(window, background=UI_CANVAS, highlightthickness=0)
+            canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+            canvas.bind("<Configure>", lambda _event: self._draw_pyfai_result())
+            self._pyfai_result_window = window
+            self._pyfai_result_canvas = canvas
+        else:
+            window.deiconify()
+            window.lift()
+        self._draw_pyfai_result()
+
+    @staticmethod
+    def _pyfai_axis_label(unit: str) -> str:
+        return {
+            "theta_custom_rad": "θ = ½ tan⁻¹(R/L) (rad)",
+            "q_A^-1": "q (Å⁻¹)",
+            "q_nm^-1": "q (nm⁻¹)",
+            "2th_deg": "2θ (deg)",
+            "2th_rad": "2θ (rad)",
+            "r_mm": "Radius (mm)",
+        }.get(unit, unit)
+
+    def _draw_notebook_reference_result(self, canvas: tk.Canvas, result: dict, width: int, height: int) -> None:
+        """Plot notebook's three 2theta curves with spike-robust display limits."""
+        p = result["profiles"]
+        cfg = result["config"]
+        source = result["source"]
+        canvas.create_text(18, 14, anchor="nw", fill=UI_TEXT,
+                           font=("Segoe UI", 11, "bold"),
+                           text=f"Notebook 1D reference · {source['filename']} · {source['average_scope']}")
+        canvas.create_text(18, 33, anchor="nw", fill=UI_TEXT_MUTED,
+                           text=f"Gaussian-fit beam ({p['beam_x']:.2f}, {p['beam_y']:.2f})" if cfg['fit_beam'] else
+                                f"Manual beam ({p['beam_x']:.2f}, {p['beam_y']:.2f})")
+        tracks = [
+            ("included", "Spots included", "#60A5FA"),
+            ("spots_masked", "Hot/Bragg spots masked", "#FB923C"),
+            ("sigma_clipped", "Ring MAD σ-clipped (notebook)", "#34D399"),
+        ]
+        lines = []
+        for key, label, color in tracks:
+            a = p[key]
+            keep = (a['radius_px'] > cfg['exclude_radius_px']) & np.isfinite(a['intensity']) & (a['count'] > 0)
+            x = a['two_theta_deg'][keep]
+            y = a['intensity'][keep]
+            if x.size:
+                lines.append((x, y, label, color))
+        if not lines:
+            canvas.create_text(width / 2, height / 2, text="No valid radial bins", fill=UI_WARNING)
+            return
+        xmin = min(float(x.min()) for x, _, _, _ in lines)
+        xmax = max(float(x.max()) for x, _, _, _ in lines)
+        vals = np.concatenate([y for _, y, _, _ in lines])
+        ymax = max(1e-9, float(np.percentile(vals, 99.0)) * 1.4)
+        ymin = min(0.0, float(np.min(vals)))
+        if ymax <= ymin: ymax = ymin + 1.0
+        if xmax <= xmin: xmax = xmin + 1.0
+        left, top, right, bottom = 74.0, 90.0, width - 24.0, height - 60.0
+        canvas.create_line(left, bottom, right, bottom, fill=UI_BORDER)
+        canvas.create_line(left, top, left, bottom, fill=UI_BORDER)
+        xs = (right - left) / (xmax - xmin)
+        ys = (bottom - top) / (ymax - ymin)
+        for i, (x, y, label, color) in enumerate(lines):
+            stride = max(1, int(np.ceil(len(x) / max(500, 2 * (right - left)))))
+            coords = []
+            for xv, yv in zip(x[::stride], y[::stride]):
+                coords.extend((left+(float(xv)-xmin)*xs,
+                               bottom-(min(ymax, max(ymin, float(yv)))-ymin)*ys))
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=color, width=1.5, smooth=False)
+            label_x = left + i * (right-left)/3
+            canvas.create_line(label_x, 69, label_x+18, 69, fill=color, width=3)
+            canvas.create_text(label_x+24, 69, text=label, fill=color, anchor='w',
+                               font=("Segoe UI", 8))
+        canvas.create_text((left+right)/2, height-22, text="2θ (degrees)", fill=UI_TEXT_MUTED)
+        canvas.create_text(18, (top+bottom)/2, text="Mean intensity per ring", angle=90, fill=UI_TEXT_MUTED)
+        for x,y,anc in ((left,bottom,'nw'),(right,bottom,'ne')):
+            value = xmin if x==left else xmax
+            canvas.create_text(x, bottom+7, anchor=anc, text=f"{value:.4g}°", fill=UI_TEXT_DIM)
+        canvas.create_text(left-8, bottom, anchor='e', text=f"{ymin:.4g}", fill=UI_TEXT_DIM)
+        canvas.create_text(left-8, top, anchor='e', text=f"{ymax:.4g}", fill=UI_TEXT_DIM)
+
+    def _draw_pyfai_result(self) -> None:
+        canvas = self._pyfai_result_canvas
+        result = self._pyfai_result
+        if canvas is None or result is None or not canvas.winfo_exists():
+            return
+        canvas.delete("all")
+        width = max(300, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+        config = result["config"]
+        source = result["source"]
+        if result["kind"] == "notebook_1d":
+            self._draw_notebook_reference_result(canvas, result, width, height)
+            return
+        if result["kind"] == "1d":
+            actual = int(source.get("frame_count_averaged", 1))
+            block_size = int(source.get("calculation_block_size", actual))
+            blocks = int(source.get("calculation_block_count", 1))
+            edited_count = int(source.get("edited_frames_in_average", 0))
+            edit_suffix = f" · {edited_count} edited" if edited_count else ""
+            title = (
+                f"{source['filename']} · all {actual} frames averaged · "
+                f"{blocks} blocks × up to {block_size}{edit_suffix}"
+            )
+        else:
+            title = f"{source['filename']} · image {source['frame_index'] + 1}{' · edited' if source.get('edited') else ''}"
+        canvas.create_text(18, 14, anchor="nw", text=title, fill=UI_TEXT, font=("Segoe UI", 11, "bold"))
+        if result["kind"] == "1d":
+            x = np.asarray(result["radial"], dtype=np.float64)
+            y = np.asarray(result["intensity"], dtype=np.float64)
+            finite = np.isfinite(x) & np.isfinite(y)
+            x, y = x[finite], y[finite]
+            if x.size < 2:
+                canvas.create_text(width / 2, height / 2, text="No finite integrated points", fill=UI_WARNING)
+                return
+            left, top, right, bottom = 72.0, 52.0, width - 22.0, height - 58.0
+            ymin, ymax = float(np.min(y)), float(np.max(y))
+            if ymax <= ymin:
+                ymax = ymin + 1.0
+            xmin, xmax = float(np.min(x)), float(np.max(x))
+            if xmax <= xmin:
+                xmax = xmin + 1.0
+            canvas.create_line(left, bottom, right, bottom, fill=UI_BORDER, width=1)
+            canvas.create_line(left, top, left, bottom, fill=UI_BORDER, width=1)
+            sx = (right - left) / (xmax - xmin)
+            sy = (bottom - top) / (ymax - ymin)
+            stride = max(1, int(math.ceil(x.size / max(500, int(right - left) * 2))))
+            coords: list[float] = []
+            for xv, yv in zip(x[::stride], y[::stride]):
+                coords.extend((left + (float(xv) - xmin) * sx, bottom - (float(yv) - ymin) * sy))
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill=UI_ACCENT, width=2, smooth=False)
+            canvas.create_text((left + right) / 2, height - 24, text=self._pyfai_axis_label("theta_custom_rad"), fill=UI_TEXT_MUTED)
+            ylabel = "Average intensity"
+            canvas.create_text(18, (top + bottom) / 2, text=ylabel, fill=UI_TEXT_MUTED, angle=90)
+            canvas.create_text(left, bottom + 8, anchor="nw", text=f"{xmin:.5g}", fill=UI_TEXT_DIM)
+            canvas.create_text(right, bottom + 8, anchor="ne", text=f"{xmax:.5g}", fill=UI_TEXT_DIM)
+            canvas.create_text(left - 8, bottom, anchor="e", text=f"{ymin:.5g}", fill=UI_TEXT_DIM)
+            canvas.create_text(left - 8, top, anchor="e", text=f"{ymax:.5g}", fill=UI_TEXT_DIM)
+            return
+
+        data = np.asarray(result["intensity"], dtype=np.float64)
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            canvas.create_text(width / 2, height / 2, text="No finite integrated intensity", fill=UI_WARNING)
+            return
+        lo = float(np.percentile(finite, 1.0))
+        hi = float(np.percentile(finite, 99.5))
+        if hi <= lo:
+            hi = lo + 1.0
+        norm = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
+        norm = np.log1p(norm * 30.0) / math.log(31.0)
+        gray = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
+        image = Image.fromarray(np.asarray(gray * 255.0, dtype=np.uint8), mode="L")
+        area_left, area_top, area_right, area_bottom = 72, 52, width - 24, height - 58
+        target_w = max(1, area_right - area_left)
+        target_h = max(1, area_bottom - area_top)
+        image.thumbnail((target_w, target_h), Image.Resampling.BILINEAR)
+        self._pyfai_result_photo = ImageTk.PhotoImage(image)
+        x0 = area_left + (target_w - image.width) / 2
+        y0 = area_top + (target_h - image.height) / 2
+        canvas.create_image(x0, y0, anchor="nw", image=self._pyfai_result_photo)
+        radial = np.asarray(result["radial"], dtype=np.float64)
+        azimuth = np.asarray(result["azimuthal"], dtype=np.float64)
+        canvas.create_text((area_left + area_right) / 2, height - 24, text=self._pyfai_axis_label(config["unit"]), fill=UI_TEXT_MUTED)
+        canvas.create_text(18, (area_top + area_bottom) / 2, text="Azimuth χ (deg)", fill=UI_TEXT_MUTED, angle=90)
+        if radial.size:
+            canvas.create_text(area_left, area_bottom + 8, anchor="nw", text=f"{radial[0]:.5g}", fill=UI_TEXT_DIM)
+            canvas.create_text(area_right, area_bottom + 8, anchor="ne", text=f"{radial[-1]:.5g}", fill=UI_TEXT_DIM)
+        if azimuth.size:
+            canvas.create_text(area_left - 8, area_bottom, anchor="e", text=f"{azimuth[0]:.5g}°", fill=UI_TEXT_DIM)
+            canvas.create_text(area_left - 8, area_top, anchor="e", text=f"{azimuth[-1]:.5g}°", fill=UI_TEXT_DIM)
+        canvas.create_text(width - 20, 14, anchor="ne", text=f"display {lo:.4g} … {hi:.4g}", fill=UI_TEXT_DIM)
+
+    def _export_pyfai_result(self) -> None:
+        result = self._pyfai_result
+        if result is None:
+            messagebox.showinfo("pyFAI", "Run an integration first.", parent=self.root)
+            return
+        source = result["source"]
+        stem = Path(source["filename"]).stem
+        frame_no = int(source["frame_index"]) + 1
+        if result["kind"] == "notebook_1d":
+            path = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Export Notebook 1D curves (2theta)",
+                defaultextension=".csv",
+                initialfile=f"{stem}_notebook_reference_2theta.csv",
+                filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            profiles = result["profiles"]
+            names = ("included", "spots_masked", "sigma_clipped")
+            reference = profiles["included"]
+            n = len(reference["radius_px"])
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["r_px", "2theta_deg",
+                                 "included_mean", "included_count",
+                                 "hotspot_masked_mean", "hotspot_masked_count",
+                                 "sigma_clipped_mean", "sigma_clipped_count"])
+                for i in range(n):
+                    row = [reference["radius_px"][i], reference["two_theta_deg"][i]]
+                    for name in names:
+                        arr = profiles[name]
+                        if i < len(arr["radius_px"]):
+                            row.extend([arr["intensity"][i], arr["count"][i]])
+                        else:
+                            row.extend([float("nan"), 0])
+                    writer.writerow(row)
+        elif result["kind"] == "1d":
+            actual = int(source.get("frame_count_averaged", 1))
+            block_size = int(source.get("calculation_block_size", actual))
+            path = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Export pyFAI all-frame 1D average",
+                defaultextension=".csv",
+                initialfile=f"{stem}_all_{actual:06d}_frames_avg_block{block_size}_pyfai_1d.csv",
+                filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            radial = np.asarray(result["radial"])
+            intensity = np.asarray(result["intensity"])
+            valid_counts = np.asarray(result.get("valid_frame_counts_per_bin", []))
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    self._pyfai_axis_label("theta_custom_rad"),
+                    "average_intensity",
+                    "valid_frame_count",
+                ])
+                if valid_counts.shape == intensity.shape:
+                    writer.writerows(zip(radial.tolist(), intensity.tolist(), valid_counts.tolist()))
+                else:
+                    writer.writerows((x, y, actual) for x, y in zip(radial.tolist(), intensity.tolist()))
+        else:
+            path = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Export pyFAI 2D cake",
+                defaultextension=".npz",
+                initialfile=f"{stem}_frame_{frame_no:06d}_pyfai_2d.npz",
+                filetypes=[("NumPy compressed", "*.npz"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            np.savez_compressed(
+                path,
+                intensity=np.asarray(result["intensity"]),
+                radial=np.asarray(result["radial"]),
+                azimuthal=np.asarray(result["azimuthal"]),
+                unit=np.asarray(result["config"]["unit"]),
+                source=np.asarray(result["source"]["path"]),
+                frame=np.asarray(frame_no),
+            )
+        self.pyfai_status_var.set(f"Exported · {Path(path).name}")
+
+    def _active_processing_family(self) -> str | None:
+        view = self.active_view
+        archive = None if view is None else view.archive
+        file_format = str(getattr(archive, "file_format", "")).upper()
+        if file_format == "HDXF":
+            return "hdxf"
+        if file_format == "HDF5":
+            return "hdf5"
+        return None
+
+    def _refresh_tools_sidebar(self) -> None:
+        """Refresh current file/frame details and live-editor availability."""
+        if not hasattr(self, "tools_apply_button"):
+            return
+        view = self.active_view
+        family = self._active_processing_family()
+        enabled = view is not None and view.archive is not None and family is not None
+        state = "normal" if enabled else "disabled"
+        for name in (
+            "tools_apply_button",
+            "tools_sum_button",
+            "tools_subtract_button",
+            "tools_pixelop_button",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state=state)
+
+        dirty = bool(view is not None and view.dirty)
+        if hasattr(self, "tools_revert_frame_button"):
+            current_dirty = bool(view is not None and view.current_frame_index in view.edited_frame_files)
+            self.tools_revert_frame_button.configure(state="normal" if current_dirty else "disabled")
+        for name in ("tools_save_edits_button", "tools_discard_edits_button"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state="normal" if dirty else "disabled")
+
+        if not enabled or view is None or view.archive is None:
+            self.tools_format_var.set("NO ACTIVE DATA")
+            self.tools_file_var.set("Open an HDXF or HDF5 file")
+            self.tools_frame_var.set("—")
+            self.tools_view_var.set("No active detector view")
+            self.tools_status_var.set("Select a detector view to enable the live editor.")
+            self.tools_edit_session_var.set("No unsaved edits")
+            return
+
+        archive = view.archive
+        fmt = str(getattr(archive, "file_format", family.upper())).upper()
+        self.tools_format_var.set(f"{fmt} TOOLS")
+        self.tools_view_var.set(f"VIEW {view.view_id:02d}{'  ·  MODIFIED' if dirty else ''}")
+        self.tools_file_var.set(str(archive.path.name))
+        frame_mark = "  ·  EDITED" if view.current_frame_index in view.edited_frame_files else ""
+        self.tools_frame_var.set(f"{view.current_frame_index + 1} / {archive.frame_count}{frame_mark}")
+        if dirty:
+            self.tools_edit_session_var.set(
+                f"{len(view.edited_frame_files)} modified frame(s) · temporary workspace active"
+            )
+            self.tools_status_var.set(
+                "Live edits are active. Save Changes writes a new detector file; Discard removes the temporary workspace."
+            )
+        else:
+            self.tools_edit_session_var.set("No unsaved edits")
+            self.tools_status_var.set(
+                f"{fmt} ready · enter values above and Apply to edit image {view.current_frame_index + 1} immediately."
+            )
+        self._update_view_title(view)
+        self._refresh_pyfai_sidebar()
+
+    def _tools_edit_mode_changed(self, _event: tk.Event | None = None) -> None:
+        mode = self.tools_edit_mode_var.get().strip()
+        labels = {
+            "Subtract value": ("SUBTRACT VALUE", "VALUE B"),
+            "Background subtraction": ("UNUSED", "UNUSED"),
+            "Replace exact value": ("EXACT VALUE", "UNUSED"),
+            "Remove inclusive range": ("RANGE LOW", "RANGE HIGH"),
+            "Lower threshold": ("LOWER THAN", "UNUSED"),
+            "Upper threshold": ("GREATER THAN", "UNUSED"),
+        }
+        a, b = labels.get(mode, ("VALUE A", "VALUE B"))
+        self.tools_edit_value_label_var.set(a)
+        self.tools_edit_value2_label_var.set(b)
+        a_enabled = mode != "Background subtraction"
+        b_enabled = mode == "Remove inclusive range"
+        fill_enabled = mode not in ("Subtract value", "Background subtraction")
+        try:
+            self.tools_edit_value_entry.configure(state="normal" if a_enabled else "disabled")
+            self.tools_edit_value2_entry.configure(state="normal" if b_enabled else "disabled")
+            self.tools_edit_fill_entry.configure(state="normal" if fill_enabled else "disabled")
+            if mode == "Background subtraction":
+                self.tools_edit_background_box.pack(fill="x", pady=(0, 7), before=self.tools_apply_button.master)
+            else:
+                self.tools_edit_background_box.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _tools_browse_background(self) -> None:
+        filename = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select background detector file",
+            filetypes=[
+                ("Detector data", "*.hdxf *.h5 *.hdf5 *.nxs"),
+                ("All files", "*.*"),
+            ],
+        )
+        if filename:
+            self.tools_edit_background_var.set(str(Path(filename)))
+
+    @staticmethod
+    def _live_edit_float(text: str, label: str) -> float:
+        value = str(text).strip()
+        if not value:
+            raise HDXFViewerError(f"{label} is required")
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise HDXFViewerError(f"{label} must be numeric") from exc
+        if not math.isfinite(number):
+            raise HDXFViewerError(f"{label} must be finite")
+        return number
+
+    @staticmethod
+    def _cast_live_frame(array: np.ndarray, dtype: np.dtype) -> np.ndarray:
+        dtype = np.dtype(dtype)
+        work = np.asarray(array)
+        if np.issubdtype(dtype, np.integer):
+            info = np.iinfo(dtype)
+            work = np.nan_to_num(work, nan=0.0, posinf=float(info.max), neginf=float(info.min))
+            work = np.clip(work, info.min, info.max)
+        return np.ascontiguousarray(work.astype(dtype, copy=False))
+
+    def _ensure_edit_temp_dir(self, view: InternalViewState) -> Path:
+        if view.edit_temp_dir is None or not view.edit_temp_dir.exists():
+            view.edit_temp_dir = Path(tempfile.mkdtemp(prefix=f"hdxf_viewer_view{view.view_id:02d}_"))
+        return view.edit_temp_dir
+
+    def _store_edited_frame(self, view: InternalViewState, index: int, frame: np.ndarray) -> None:
+        folder = self._ensure_edit_temp_dir(view)
+        path = folder / f"frame_{int(index):08d}.npy"
+        np.save(path, np.ascontiguousarray(frame), allow_pickle=False)
+        view.edited_frame_files[int(index)] = path
+
+    def _load_view_frame(self, view: InternalViewState, index: int) -> np.ndarray:
+        edited = view.edited_frame_files.get(int(index))
+        if edited is not None and edited.is_file():
+            return np.ascontiguousarray(np.load(edited, allow_pickle=False))
+        if view.archive is None:
+            raise HDXFViewerError("no detector source is open")
+        return view.archive.get_frame(int(index))
+
+    def _active_roi_mask_for_edit(self, view: InternalViewState, shape: tuple[int, int]) -> np.ndarray | None:
+        if not self.tools_edit_use_roi_var.get():
+            return None
+        roi = view.canvas.get_roi()
+        if roi is None:
+            raise HDXFViewerError("Draw an ROI first or disable 'Apply only inside current ROI'.")
+        x, y, width, height = roi
+        local = view.canvas.roi_mask()
+        if local is None:
+            raise HDXFViewerError("The current ROI could not be converted to a mask.")
+        mask = np.zeros(shape, dtype=bool)
+        mask[y:y + height, x:x + width] = local
+        return mask
+
+    def _apply_tools_current_frame_edit(self) -> None:
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showinfo("Live editor", "Open a detector image first.", parent=self.root)
+            return
+        mode = self.tools_edit_mode_var.get().strip()
+        try:
+            source = np.asarray(view.current_frame)
+            work = source.astype(np.float64, copy=True)
+            mask = self._active_roi_mask_for_edit(view, source.shape)
+            target_mask = np.ones(source.shape, dtype=bool) if mask is None else mask
+
+            if mode == "Subtract value":
+                value = self._live_edit_float(self.tools_edit_value_var.get(), "Subtract value")
+                work[target_mask] -= value
+            elif mode == "Background subtraction":
+                background_path = Path(self.tools_edit_background_var.get().strip())
+                if not background_path.is_file():
+                    raise HDXFViewerError("Select a readable background HDXF/HDF5 file.")
+                try:
+                    frame_number = int(self.tools_edit_background_frame_var.get().strip() or "1")
+                except ValueError as exc:
+                    raise HDXFViewerError("Background frame must be an integer") from exc
+                background_archive = self._open_detector_source(background_path)
+                try:
+                    if frame_number < 1 or frame_number > background_archive.frame_count:
+                        raise HDXFViewerError(
+                            f"Background frame must be within 1..{background_archive.frame_count}"
+                        )
+                    background = np.asarray(background_archive.get_frame(frame_number - 1), dtype=np.float64)
+                finally:
+                    background_archive.close()
+                if background.shape != work.shape:
+                    raise HDXFViewerError(
+                        f"Background shape {background.shape} does not match current frame {work.shape}"
+                    )
+                work[target_mask] -= background[target_mask]
+            elif mode == "Replace exact value":
+                exact = self._live_edit_float(self.tools_edit_value_var.get(), "Exact value")
+                fill = self._live_edit_float(self.tools_edit_fill_var.get(), "Fill value")
+                exact_mask = (source == exact) & target_mask
+                work[exact_mask] = fill
+            elif mode == "Remove inclusive range":
+                low = self._live_edit_float(self.tools_edit_value_var.get(), "Range low")
+                high = self._live_edit_float(self.tools_edit_value2_var.get(), "Range high")
+                if low > high:
+                    raise HDXFViewerError("Range low cannot be greater than range high")
+                fill = self._live_edit_float(self.tools_edit_fill_var.get(), "Fill value")
+                select = (work >= low) & (work <= high) & target_mask
+                work[select] = fill
+            elif mode == "Lower threshold":
+                value = self._live_edit_float(self.tools_edit_value_var.get(), "Lower threshold")
+                fill = self._live_edit_float(self.tools_edit_fill_var.get(), "Fill value")
+                work[(work < value) & target_mask] = fill
+            elif mode == "Upper threshold":
+                value = self._live_edit_float(self.tools_edit_value_var.get(), "Upper threshold")
+                fill = self._live_edit_float(self.tools_edit_fill_var.get(), "Fill value")
+                work[(work > value) & target_mask] = fill
+            else:
+                raise HDXFViewerError(f"Unknown live-edit operation: {mode}")
+
+            edited = self._cast_live_frame(work, source.dtype)
+            self._store_edited_frame(view, view.current_frame_index, edited)
+            view.current_frame = edited
+            self._histogram_domain = None
+            self._histogram_axis = None
+            self._histogram_values_cache = None
+            self._histogram_cache_key = None
+            self._histogram_logs_cache = None
+            self._render_view_display(view)
+            self._refresh_active_side_panels()
+            self._update_image_info()
+            self._update_roi_statistics(view)
+            self._refresh_tools_sidebar()
+            self._refresh_title()
+            self.status_var.set(
+                f"View {view.view_id} · image {view.current_frame_index + 1} edited in temporary workspace"
+            )
+        except Exception as exc:
+            messagebox.showerror("Live edit failed", f"{type(exc).__name__}: {exc}", parent=self.root)
+
+    def _open_direct_pixel_editor(
+        self,
+        view: InternalViewState,
+        pixel: tuple[int, int],
+        *,
+        root_x: int,
+        root_y: int,
+    ) -> None:
+        """Open a compact direct-value editor for one detector pixel.
+
+        The edit is committed through the same temporary per-View workspace as
+        the sidebar live editor, so Save/Discard/Cancel semantics are identical.
+        """
+        if view.archive is None or view.current_frame is None:
+            view.canvas.clear_pixel_edit_selection()
+            return
+        x, y = (int(pixel[0]), int(pixel[1]))
+        frame = np.asarray(view.current_frame)
+        if not (0 <= y < frame.shape[0] and 0 <= x < frame.shape[1]):
+            view.canvas.clear_pixel_edit_selection()
+            return
+
+        current = frame[y, x]
+        dtype = np.dtype(frame.dtype)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Pixel Value")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(background=UI_SURFACE)
+
+        shell = ttk.Frame(dialog, style="Card.TFrame", padding=(14, 12))
+        shell.pack(fill="both", expand=True)
+        ttk.Label(shell, text="DIRECT PIXEL EDIT", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            shell,
+            text=(
+                f"View {view.view_id:02d} · Image {view.current_frame_index + 1} · "
+                f"X={x}, Y={y} · dtype={dtype}"
+            ),
+            style="CardSubtitle.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+
+        info = ttk.Frame(shell, style="CardAlt.TFrame", padding=(9, 7))
+        info.pack(fill="x", pady=(0, 10))
+        ttk.Label(info, text="CURRENT", style="FieldLabel.TLabel").pack(side="left")
+        ttk.Label(info, text=_format_value(current), style="ReadoutValue.TLabel").pack(side="right")
+
+        ttk.Label(shell, text="NEW VALUE", style="FieldLabel.TLabel").pack(anchor="w")
+        value_var = tk.StringVar(value=_format_value(current))
+        entry = ttk.Entry(shell, textvariable=value_var, style="Modern.TEntry", width=28)
+        entry.pack(fill="x", pady=(3, 10))
+
+        hint = (
+            "Enter an integer within the dtype range."
+            if np.issubdtype(dtype, np.integer)
+            else "Enter a finite numeric value."
+        )
+        ttk.Label(shell, text=hint, style="CardSubtitle.TLabel").pack(anchor="w", pady=(0, 10))
+
+        buttons = ttk.Frame(shell, style="Card.TFrame")
+        buttons.pack(fill="x")
+
+        closed = False
+
+        def finish() -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            view.canvas.clear_pixel_edit_selection()
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def apply_value(_event: tk.Event | None = None) -> str:
+            text = value_var.get().strip()
+            try:
+                if not text:
+                    raise HDXFViewerError("New pixel value is required")
+                if np.issubdtype(dtype, np.integer):
+                    # Decimal/scientific notation is accepted only when it
+                    # represents an exact integer (e.g. 515455754 or 5e2).
+                    number = float(text)
+                    if not math.isfinite(number) or not number.is_integer():
+                        raise HDXFViewerError(f"{dtype} requires an integer value")
+                    value = int(number)
+                    info_dtype = np.iinfo(dtype)
+                    if value < int(info_dtype.min) or value > int(info_dtype.max):
+                        raise HDXFViewerError(
+                            f"Value {value} is outside {dtype} range "
+                            f"[{int(info_dtype.min)}, {int(info_dtype.max)}]"
+                        )
+                else:
+                    value = float(text)
+                    if not math.isfinite(value):
+                        raise HDXFViewerError("Pixel value must be finite")
+
+                edited = np.array(view.current_frame, copy=True)
+                edited[y, x] = value
+                edited = np.ascontiguousarray(edited, dtype=dtype)
+                self._store_edited_frame(view, view.current_frame_index, edited)
+                view.current_frame = edited
+                self._histogram_domain = None
+                self._histogram_axis = None
+                self._histogram_values_cache = None
+                self._histogram_cache_key = None
+                self._histogram_logs_cache = None
+                self._render_view_display(view)
+                self._refresh_active_side_panels()
+                self._update_image_info()
+                self._update_roi_statistics(view)
+                self._refresh_tools_sidebar()
+                self._refresh_title()
+                self.status_var.set(
+                    f"View {view.view_id} · image {view.current_frame_index + 1} · "
+                    f"pixel X={x}, Y={y}: {_format_value(current)} → {_format_value(edited[y, x])} · "
+                    "temporary workspace"
+                )
+                finish()
+            except Exception as exc:
+                messagebox.showerror("Pixel edit failed", f"{type(exc).__name__}: {exc}", parent=dialog)
+                try:
+                    entry.focus_set()
+                    entry.selection_range(0, "end")
+                except tk.TclError:
+                    pass
+            return "break"
+
+        ttk.Button(buttons, text="Apply", style="Accent.TButton", command=apply_value).pack(side="left", fill="x", expand=True)
+        ttk.Button(buttons, text="Cancel", style="Secondary.TButton", command=finish).pack(side="left", padx=(6, 0))
+        dialog.protocol("WM_DELETE_WINDOW", finish)
+        dialog.bind("<Return>", apply_value)
+        dialog.bind("<KP_Enter>", apply_value)
+        dialog.bind("<Escape>", lambda _event: (finish(), "break")[1])
+
+        dialog.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        px = min(max(0, int(root_x) + 14), max(0, screen_w - width - 8))
+        py = min(max(0, int(root_y) + 14), max(0, screen_h - height - 40))
+        dialog.geometry(f"+{px}+{py}")
+        try:
+            dialog.grab_set()
+            entry.focus_set()
+            entry.selection_range(0, "end")
+        except tk.TclError:
+            pass
+
+    def _revert_tools_current_frame(self) -> None:
+        view = self.active_view
+        if view is None or view.archive is None:
+            return
+        index = int(view.current_frame_index)
+        path = view.edited_frame_files.pop(index, None)
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            frame = view.archive.get_frame(index)
+        except Exception as exc:
+            messagebox.showerror("Revert failed", str(exc), parent=self.root)
+            return
+        view.current_frame = np.ascontiguousarray(frame)
+        self._render_view_display(view)
+        self._refresh_active_side_panels()
+        self._update_image_info()
+        self._update_roi_statistics(view)
+        if not view.edited_frame_files:
+            self._cleanup_view_edit_temp(view)
+        self._refresh_tools_sidebar()
+        self._refresh_title()
+        self.status_var.set(f"Image {index + 1} reverted to source data")
+
+    def _cleanup_view_edit_temp(self, view: InternalViewState) -> None:
+        folder = view.edit_temp_dir
+        view.edited_frame_files.clear()
+        view.edit_temp_dir = None
+        if folder is not None:
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+            except Exception:
+                pass
+        self._update_view_title(view)
+
+    def _discard_view_edits(self, view: InternalViewState, *, reload_current: bool = True) -> None:
+        current = int(view.current_frame_index)
+        self._cleanup_view_edit_temp(view)
+        if reload_current and view.archive is not None:
+            try:
+                frame = view.archive.get_frame(current)
+                view.current_frame = np.ascontiguousarray(frame)
+                if view is self.active_view:
+                    self._render_view_display(view)
+                    self._refresh_active_side_panels()
+                    self._update_image_info()
+                    self._update_roi_statistics(view)
+            except Exception:
+                pass
+        self._refresh_tools_sidebar()
+        self._refresh_title()
+
+    def _discard_active_view_edits(self) -> None:
+        view = self.active_view
+        if view is None or not view.dirty:
+            return
+        if not messagebox.askyesno(
+            "Discard changes?",
+            f"Discard {len(view.edited_frame_files)} modified frame(s) in View {view.view_id}?\n\nThe temporary workspace will be deleted.",
+            parent=self.root,
+        ):
+            return
+        self._discard_view_edits(view, reload_current=True)
+        self.status_var.set("Temporary edits discarded")
+
+    def _update_view_title(self, view: InternalViewState) -> None:
+        filename = view.archive.path.name if view.archive is not None else "NO FILE"
+        marker = " *" if view.dirty else ""
+        view.title_var.set(f"VIEW {view.view_id:02d}{marker}   ·   {filename}")
+        if view is self.active_view:
+            chip = filename if len(filename) <= 26 else f"{filename[:11]}…{filename[-12:]}"
+            self.active_view_var.set(f"VIEW {view.view_id:02d}{marker} · {chip}")
+
+    @staticmethod
+    def _edited_output_stem(path: Path) -> str:
+        stem = path.stem
+        if stem.lower().endswith("_master"):
+            stem = stem[:-7]
+        return stem + "_edited"
+
+    def _choose_edit_save_path(self, view: InternalViewState) -> Path | None:
+        if view.archive is None:
+            return None
+        source = view.source_path or view.archive.path
+        family = str(getattr(view.archive, "file_format", "")).upper()
+        if family == "HDF5":
+            name = self._edited_output_stem(source) + "_master.h5"
+            filename = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save edited HDF5 bundle",
+                initialdir=str(source.parent),
+                initialfile=name,
+                defaultextension=".h5",
+                filetypes=[("HDF5 master", "*.h5"), ("HDF5 file", "*.hdf5"), ("All files", "*.*")],
+            )
+        else:
+            name = self._edited_output_stem(source) + ".hdxf"
+            filename = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save edited HDXF archive",
+                initialdir=str(source.parent),
+                initialfile=name,
+                defaultextension=".hdxf",
+                filetypes=[("HDXF archive", "*.hdxf"), ("All files", "*.*")],
+            )
+        return Path(filename).resolve() if filename else None
+
+    @staticmethod
+    def _data_output_name(source_name: str, output_master: Path) -> str:
+        lower = source_name.lower()
+        base = output_master.stem[:-7] if output_master.stem.lower().endswith("_master") else output_master.stem
+        pos = lower.find("_data_")
+        if pos >= 0:
+            return base + source_name[pos:]
+        return f"{base}__{source_name}"
+
+    def _clone_hdf5_bundle(self, source_master: Path, output_master: Path) -> None:
+        if h5py is None:
+            raise HDXFViewerError("Saving edited HDF5 requires h5py")
+        source_master = source_master.resolve()
+        output_master = output_master.resolve()
+        output_master.parent.mkdir(parents=True, exist_ok=True)
+        if output_master == source_master:
+            raise HDXFViewerError("Choose a new output master; live editing never overwrites the source in-place.")
+        source_archive = HDF5Archive(source_master)
+        try:
+            shutil.copy2(source_master, output_master)
+            copied: dict[Path, Path] = {}
+            link_targets: dict[str, tuple[str, str]] = {}
+            for source in source_archive._frame_sources:
+                physical = Path(str(source.get("physical_file", source_master))).resolve()
+                source_path = str(source.get("source_path") or "")
+                link = source.get("link")
+                if physical == source_master:
+                    continue
+                target = copied.get(physical)
+                if target is None:
+                    target_name = self._data_output_name(physical.name, output_master)
+                    target = output_master.parent / target_name
+                    if target.resolve() == physical:
+                        raise HDXFViewerError("Output data file would overwrite the source bundle")
+                    shutil.copy2(physical, target)
+                    copied[physical] = target
+                if isinstance(link, dict) and link.get("type") == "ExternalLink" and source_path.startswith("/entry/data/"):
+                    link_name = source_path.rsplit("/", 1)[-1]
+                    link_targets[link_name] = (target.name, str(source.get("dataset_path") or link.get("target_path") or "/entry/data/data"))
+            if link_targets:
+                with h5py.File(output_master, "r+") as handle:
+                    group = handle.get("/entry/data")
+                    if isinstance(group, h5py.Group):
+                        for link_name, (filename, target_path) in link_targets.items():
+                            if link_name in group:
+                                del group[link_name]
+                            group[link_name] = h5py.ExternalLink(filename, target_path)
+        finally:
+            source_archive.close()
+
+    def _patch_hdf5_master_frames_in_place(self, master: Path, edits: dict[int, Path]) -> None:
+        """Patch edited logical frames without keeping any read-only HDF5 handles open."""
+        master = Path(master).resolve()
+        sources: list[tuple[int, int, Path, str, tuple[int, ...]]] = []
+        global_start = 0
+        with h5py.File(master, "r") as handle:
+            entry = handle.get("/entry/data")
+            if isinstance(entry, h5py.Dataset):
+                shape = tuple(int(v) for v in entry.shape)
+                count = 1 if len(shape) == 2 else int(np.prod(shape[:-2], dtype=np.int64))
+                sources.append((0, count, master, "/entry/data", shape))
+                global_start = count
+            elif isinstance(entry, h5py.Group):
+                for name in sorted(entry.keys()):
+                    link = entry.get(name, getlink=True)
+                    if isinstance(link, h5py.ExternalLink):
+                        raw = Path(os.fsdecode(link.filename))
+                        physical = raw if raw.is_absolute() else master.parent / raw
+                        physical = physical.resolve()
+                        dataset_path = str(link.path)
+                        with h5py.File(physical, "r") as external:
+                            dataset = external[dataset_path]
+                            shape = tuple(int(v) for v in dataset.shape)
+                    else:
+                        dataset = entry[name]
+                        if not isinstance(dataset, h5py.Dataset):
+                            continue
+                        physical = master
+                        dataset_path = str(dataset.name)
+                        shape = tuple(int(v) for v in dataset.shape)
+                    count = 1 if len(shape) == 2 else int(np.prod(shape[:-2], dtype=np.int64))
+                    sources.append((global_start, count, physical, dataset_path, shape))
+                    global_start += count
+            else:
+                raise HDXFViewerError("Saved HDF5 master has no readable /entry/data sequence")
+
+        grouped: dict[Path, list[tuple[str, int, tuple[int, ...], Path]]] = {}
+        for index, npy_path in sorted(edits.items()):
+            chosen = None
+            for start_index, count, physical, dataset_path, shape in sources:
+                if start_index <= int(index) < start_index + count:
+                    chosen = (physical, dataset_path, int(index) - start_index, shape)
+                    break
+            if chosen is None:
+                raise HDXFViewerError(f"No HDF5 Dataset covers edited image {int(index) + 1}")
+            physical, dataset_path, local, shape = chosen
+            grouped.setdefault(physical, []).append((dataset_path, local, shape, npy_path))
+
+        for physical, items in grouped.items():
+            with h5py.File(physical, "r+") as handle:
+                for dataset_path, local, shape, npy_path in items:
+                    dataset = handle[dataset_path]
+                    frame = np.load(npy_path, allow_pickle=False)
+                    cast = frame.astype(dataset.dtype, copy=False)
+                    if dataset.ndim == 2:
+                        dataset[...] = cast
+                    elif dataset.ndim == 3:
+                        dataset[local, ...] = cast
+                    else:
+                        coords = np.unravel_index(local, shape[:-2], order="C")
+                        selection = tuple(int(v) for v in coords) + (slice(None), slice(None))
+                        dataset[selection] = cast
+                handle.flush()
+
+        check = HDF5Archive(master)
+        try:
+            for index, npy_path in edits.items():
+                expected = np.load(npy_path, allow_pickle=False)
+                actual = check.get_frame(int(index))
+                if not np.array_equal(actual, expected):
+                    raise HDXFViewerError(f"Saved HDF5 verification failed at image {int(index) + 1}")
+        finally:
+            check.close()
+
+    def _run_edit_subprocess(self, cmd: list[str], label: str) -> str:
+        self.status_var.set(label)
+        self.root.update_idletasks()
+        creationflags = 0
+        if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = int(subprocess.CREATE_NO_WINDOW)
+        result = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
+        if result.returncode != 0:
+            tail = "\n".join(result.stdout.splitlines()[-30:])
+            raise HDXFViewerError(f"{label} failed (exit {result.returncode})\n\n{tail}")
+        return result.stdout
+
+    def _save_hdf5_edits(self, view: InternalViewState, destination: Path) -> None:
+        source = (view.source_path or (view.archive.path if view.archive is not None else None))
+        if source is None:
+            raise HDXFViewerError("No source HDF5 is available")
+        self._clone_hdf5_bundle(Path(source), destination)
+        self._patch_hdf5_master_frames_in_place(destination, view.edited_frame_files)
+
+    def _save_hdxf_edits(self, view: InternalViewState, destination: Path) -> None:
+        source = (view.source_path or (view.archive.path if view.archive is not None else None))
+        if source is None:
+            raise HDXFViewerError("No source HDXF is available")
+        folder = self._ensure_edit_temp_dir(view)
+        work = folder / "hdxf_save_work"
+        if work.exists():
+            shutil.rmtree(work, ignore_errors=True)
+        restored = work / "restored"
+        restored.mkdir(parents=True, exist_ok=True)
+        restore_script = Path(__file__).resolve().with_name("hdxf_to_hdf5.py")
+        convert_script = Path(__file__).resolve().with_name("hdf5_to_hdxf.py")
+        if not restore_script.is_file() or not convert_script.is_file():
+            raise HDXFViewerError("Saving edited HDXF requires hdxf_to_hdf5.py and hdf5_to_hdxf.py beside the Viewer")
+        self._run_edit_subprocess(
+            [sys.executable, "-u", str(restore_script), str(source), "-o", str(restored), "--overwrite", "--verify"],
+            "Restoring temporary HDF5 workspace…",
+        )
+        masters = sorted(restored.glob("*_master.h5"))
+        if not masters:
+            masters = sorted(restored.glob("*.h5"))
+        if not masters:
+            raise HDXFViewerError("HDXF restore completed but no master HDF5 was found")
+        master = masters[0]
+        self._patch_hdf5_master_frames_in_place(master, view.edited_frame_files)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._run_edit_subprocess(
+            [
+                sys.executable, "-u", str(convert_script), str(master),
+                "-o", str(destination),
+                "--frame-transform", "delta",
+                "--block-frames", "64",
+                "--keyframe-interval-blocks", "4",
+                "--delta-stream", "auto",
+                "--delta-filter", "learn",
+                "--manifest-layout", "compact",
+                "--frame-index-layout", "binary",
+                "--overwrite",
+                "--no-analysis-log",
+            ],
+            "Rebuilding edited HDXF archive…",
+        )
+        if not destination.is_file():
+            raise HDXFViewerError(f"Edited HDXF was not created: {destination}")
+
+    def _save_view_edits(self, view: InternalViewState, *, switch_to_saved: bool) -> bool:
+        if not view.dirty:
+            return True
+        destination = self._choose_edit_save_path(view)
+        if destination is None:
+            return False
+        try:
+            family = str(getattr(view.archive, "file_format", "")).upper() if view.archive is not None else ""
+            if family == "HDF5":
+                self._save_hdf5_edits(view, destination)
+            elif family == "HDXF":
+                self._save_hdxf_edits(view, destination)
+            else:
+                raise HDXFViewerError("Unsupported detector format for saving edits")
+        except Exception as exc:
+            messagebox.showerror("Save changes failed", f"{type(exc).__name__}: {exc}", parent=self.root)
+            return False
+
+        self._cleanup_view_edit_temp(view)
+        self.status_var.set(f"Saved edited detector data: {destination.name}")
+        if switch_to_saved and view in self.views:
+            self.activate_view(view, refresh=False)
+            self.open_path(destination)
+        else:
+            self._refresh_tools_sidebar()
+            self._refresh_title()
+        return True
+
+    def _save_active_view_edits(self) -> None:
+        view = self.active_view
+        if view is None or not view.dirty:
+            return
+        self._save_view_edits(view, switch_to_saved=True)
+
+    def _confirm_view_edits(self, view: InternalViewState, *, reason: str) -> bool:
+        if not view.dirty:
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved detector edits",
+            f"View {view.view_id} has {len(view.edited_frame_files)} modified frame(s).\n\nSave changes before {reason}?\n\nYes = Save As\nNo = Discard temporary changes\nCancel = Keep editing",
+            parent=self.root,
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self._save_view_edits(view, switch_to_saved=False)
+        self._discard_view_edits(view, reload_current=False)
+        return True
+
+    def _confirm_all_edits_before_close(self) -> bool:
+        dirty_views = [view for view in self.views if view.dirty]
+        if not dirty_views:
+            return True
+        total = sum(len(view.edited_frame_files) for view in dirty_views)
+        answer = messagebox.askyesnocancel(
+            "Unsaved detector edits",
+            f"{len(dirty_views)} View(s) contain {total} modified frame(s).\n\nSave changes before closing the Viewer?\n\nYes = save each modified View\nNo = discard and delete all temporary files\nCancel = return to Viewer",
+            parent=self.root,
+        )
+        if answer is None:
+            return False
+        if answer:
+            for view in dirty_views:
+                if not self._save_view_edits(view, switch_to_saved=False):
+                    return False
+            return True
+        for view in dirty_views:
+            self._discard_view_edits(view, reload_current=False)
+        return True
+
+    def _open_active_processing_tool(self, kind: str, *, current_frame: bool = False) -> None:
+        view = self.active_view
+        family = self._active_processing_family()
+        if view is None or view.archive is None or family is None:
+            messagebox.showinfo(
+                "No active detector data",
+                "Open/select an HDXF or HDF5 detector view first.",
+                parent=self.root,
+            )
+            return
+        self._open_hdxf_processing_tool(kind, family=family)
+        if self._processing_panel is None or not self._processing_panel.winfo_exists():
+            return
+        if current_frame:
+            image_number = int(view.current_frame_index) + 1
+            self.processing_frame_from_var.set("")
+            self.processing_frame_to_var.set("")
+            self.processing_select_var.set(str(image_number))
+            self._processing_set_default_output(force=True)
+            self.processing_activity_var.set(
+                f"Current image {image_number} is preselected. Configure Subtract / Filter settings, then press Start Processing."
+            )
+            self.processing_work_var.set(f"Frames  current image {image_number}")
+
+    def _open_current_frame_subtract_tool(self) -> None:
+        self._open_active_processing_tool("subtract", current_frame=True)
+
+    def _open_active_sum_tool(self) -> None:
+        self._open_active_processing_tool("sum")
+
+    def _open_active_subtract_tool(self) -> None:
+        self._open_active_processing_tool("subtract")
+
+    def _open_active_pixelop_tool(self) -> None:
+        self._open_active_processing_tool("pixelop")
 
     def _on_sidebar_content_configure(self, _event: tk.Event | None = None) -> None:
         if not hasattr(self, "sidebar_canvas"):
@@ -9174,7 +12655,8 @@ class HDXFViewerApp:
         self.root.bind("<Next>", lambda _e: self.step_frame(10))
         self.root.bind("<Home>", lambda _e: self.load_frame(0))
         self.root.bind("<End>", lambda _e: self.load_frame(self.archive.frame_count - 1 if self.archive else 0))
-        self.root.bind("<space>", lambda _e: self.toggle_playback())
+        self.root.bind("<space>", lambda _e: self.toggle_playback("selected"))
+        self.root.bind("<Shift-space>", lambda _e: self.toggle_playback("all"))
         self.root.bind("<plus>", lambda _e: self._zoom_in())
         self.root.bind("<equal>", lambda _e: self._zoom_in())
         self.root.bind("<minus>", lambda _e: self._zoom_out())
@@ -9260,12 +12742,28 @@ class HDXFViewerApp:
                         f"resolution rings shown (λ={geometry['wavelength_angstrom']:.5g} Å, "
                         f"distance={geometry['distance_m']:.5g} m) · source HDF5/HDXF unchanged"
                     )
+            self._pyfai_geometry_context = None
+            self._refresh_pyfai_sidebar(force_geometry=True)
+
+        def pixel_edit_callback(pixel: tuple[int, int], root_x: int, root_y: int) -> None:
+            view = holder.get("view")
+            if view is None:
+                return
+            self.activate_view(view, refresh=False)
+            self._open_direct_pixel_editor(view, pixel, root_x=root_x, root_y=root_y)
+
+        def calibration_point_callback(pixel: tuple[int, int]) -> bool:
+            view = holder.get("view")
+            if view is None:
+                return False
+            return self._pyfai_add_calibration_point(view, pixel)
 
         def roi_callback(roi: tuple[int, int, int, int] | None) -> None:
             view = holder.get("view")
             if view is None or view is not self.active_view:
                 return
             self._sync_roi_sidebar_from_view(view)
+            self._refresh_tools_sidebar()
             if roi is None:
                 self.status_var.set("ROI cleared · source HDF5/HDXF unchanged")
             else:
@@ -9289,6 +12787,8 @@ class HDXFViewerApp:
             view_callback,
             beam_center_callback,
             roi_callback,
+            pixel_edit_callback,
+            calibration_point_callback,
         )
         canvas.pack(side="top", fill="both", expand=True)
         template = self.active_view
@@ -9343,6 +12843,8 @@ class HDXFViewerApp:
     def close_active_view(self) -> None:
         view = self.active_view
         if view is None:
+            return
+        if not self._confirm_view_edits(view, reason="closing this View"):
             return
         self.stop_playback()
         if view.archive is not None:
@@ -9412,7 +12914,11 @@ class HDXFViewerApp:
     def activate_view(self, view: InternalViewState | None, *, refresh: bool = True) -> None:
         if view is None or view not in self.views:
             return
-        if self.playing and view is not self.active_view:
+        if (
+            self.playing
+            and self.playback_scope == "selected"
+            and view is not self.active_view
+        ):
             self.stop_playback()
         self.active_view_index = self.views.index(view)
         for item in self.views:
@@ -9466,6 +12972,7 @@ class HDXFViewerApp:
             self._update_histogram()
             self._update_image_info()
             self._update_metadata()
+        self._refresh_tools_sidebar()
         self._refresh_title()
 
     def _toggle_show_values(self) -> None:
@@ -9501,7 +13008,7 @@ class HDXFViewerApp:
         suffix = ""
         if view is not None:
             suffix = f" — {view.label()}"
-        self.root.title(f"HDXF Viewer 0.5.3.0 · HDF5 PROCESS · ROI DEEPER BLUE SHADE · MOVE + RESIZE{suffix}")
+        self.root.title(f"HDXF Viewer 0.5.12.0 · PYFAI ALL-FRAME AVG · LIVE EDIT{suffix}")
 
     def _drop_target_widgets(self) -> tuple[tk.Misc, ...]:
         targets: list[tk.Misc] = []
@@ -9862,6 +13369,8 @@ class HDXFViewerApp:
             view = self.add_view()
             if view is None:
                 return
+        if view.dirty and not self._confirm_view_edits(view, reason="opening another file in this View"):
+            return
         self.stop_playback()
         path = Path(path).resolve()
         self.status_var.set(f"Opening {path} …")
@@ -9894,6 +13403,9 @@ class HDXFViewerApp:
         view.canvas.clear_manual_beam_center(notify=False)
         view.canvas.clear_roi(notify=False)
         view.archive = new_archive
+        view.source_path = path
+        # A newly opened source always starts a clean edit session.
+        self._cleanup_view_edit_temp(view)
         view.current_frame_index = 0
         view.current_frame = frame
         view.current_display = None
@@ -9923,6 +13435,7 @@ class HDXFViewerApp:
             self._update_metadata()
         except Exception:
             pass
+        self._refresh_tools_sidebar()
         self._refresh_title()
         format_label = getattr(view.archive, "file_format", "DATA")
         self.file_summary_var.set(
@@ -9935,6 +13448,21 @@ class HDXFViewerApp:
         )
 
     def _shutdown_resources(self) -> None:
+        if self._pyfai_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._pyfai_poll_after_id)
+            except tk.TclError:
+                pass
+            self._pyfai_poll_after_id = None
+        if self._pyfai_result_window is not None:
+            try:
+                if self._pyfai_result_window.winfo_exists():
+                    self._pyfai_result_window.destroy()
+            except tk.TclError:
+                pass
+            self._pyfai_result_window = None
+            self._pyfai_result_canvas = None
+            self._pyfai_result_photo = None
         self.stop_playback()
         self._file_drop_controller.close()
         process = self._converter_process
@@ -9978,8 +13506,11 @@ class HDXFViewerApp:
             if view.archive is not None:
                 view.archive.close()
                 view.archive = None
+            self._cleanup_view_edit_temp(view)
 
     def close(self) -> None:
+        if not self._confirm_all_edits_before_close():
+            return
         self.manager.close_window(self)
 
     def load_frame(
@@ -9997,7 +13528,10 @@ class HDXFViewerApp:
         self.status_var.set(f"Reading image {index + 1} …")
         self.root.update_idletasks()
         try:
-            frame = self.archive.get_frame(index)
+            active_view = self.active_view
+            if active_view is None:
+                raise HDXFViewerError("no active image view")
+            frame = self._load_view_frame(active_view, index)
         except Exception as exc:
             self.stop_playback()
             messagebox.showerror("Read failed", f"{type(exc).__name__}: {exc}")
@@ -10036,6 +13570,7 @@ class HDXFViewerApp:
             source_view = self.active_view
             if source_view is not None:
                 self.manager.request_frame_sync(source_view, index)
+        self._refresh_tools_sidebar()
         return True
 
     def load_frame_for_view(
@@ -10059,7 +13594,7 @@ class HDXFViewerApp:
             )
         index = max(0, min(view.archive.frame_count - 1, int(index)))
         try:
-            frame = view.archive.get_frame(index)
+            frame = self._load_view_frame(view, index)
         except Exception:
             return False
         view.current_frame_index = index
@@ -10115,22 +13650,130 @@ class HDXFViewerApp:
         format_label = getattr(self.archive, "file_format", "DATA")
         self.frame_label_var.set(f"/ {self.archive.frame_count}   ({format_label} {index})")
 
-    def toggle_playback(self) -> None:
+    def _playable_views(self) -> list[InternalViewState]:
+        """Return views that currently contain a readable detector archive."""
+        return [view for view in self.views if view.archive is not None]
+
+    def _update_playback_buttons(self) -> None:
+        selected_text = "▶ SELECTED"
+        all_text = "▶ ALL"
+        if self.playing and self.playback_scope == "selected":
+            selected_text = "Ⅱ SELECTED"
+        elif self.playing and self.playback_scope == "all":
+            all_text = "Ⅱ ALL"
+        if hasattr(self, "play_selected_button"):
+            self.play_selected_button.configure(text=selected_text)
+        if hasattr(self, "play_all_button"):
+            self.play_all_button.configure(text=all_text)
+
+    def toggle_playback(self, scope: str = "selected") -> None:
+        """Toggle playback for only the selected pane or all loaded panes."""
+        scope = "all" if str(scope).lower() == "all" else "selected"
+        if self.playing and self.playback_scope == scope:
+            self.stop_playback()
+            return
         if self.playing:
             self.stop_playback()
-        else:
-            self.start_playback()
+        self.start_playback(scope)
 
-    def start_playback(self) -> None:
-        if self.archive is None or self.playing:
+    def _load_all_views_at_index(self, index: int, *, playback: bool) -> bool:
+        """Load one common image index into every loaded view.
+
+        All-view playback deliberately ignores the optional manual
+        ``Synchronize Image Number`` switch: choosing PLAY ALL is itself an
+        explicit request for synchronized image numbers.  The active pane is
+        rendered last so the shared sidebar/histogram ends on the correct data.
+        """
+        playable = self._playable_views()
+        if not playable:
+            return False
+        common_count = min(int(view.archive.frame_count) for view in playable if view.archive is not None)
+        if common_count <= 0:
+            return False
+        index = min(max(0, int(index)), common_count - 1)
+        active = self.active_view if self.active_view in playable else None
+
+        for view in playable:
+            if view is active:
+                continue
+            if not self.load_frame_for_view(
+                view, index, recompute_contrast=False, playback=playback
+            ):
+                return False
+
+        if active is not None:
+            if not self.load_frame(
+                index,
+                recompute_contrast=False,
+                sync_controls=True,
+                playback=playback,
+                notify_sync=False,
+            ):
+                return False
+        else:
+            # Sidebar focus may currently be an empty view. Keep playback
+            # running in the loaded panes without forcing focus to move.
+            for view in playable:
+                if view.current_frame_index != index:
+                    return False
+
+        return True
+
+    def start_playback(self, scope: str = "selected") -> None:
+        scope = "all" if str(scope).lower() == "all" else "selected"
+        if self.playing:
             return
+
+        if scope == "selected":
+            view = self.active_view
+            if view is None or view.archive is None:
+                self.status_var.set("Selected view has no detector data to play")
+                return
+            targets = [view]
+        else:
+            targets = self._playable_views()
+            if not targets:
+                self.status_var.set("No loaded views to play")
+                return
+            common_count = min(
+                int(view.archive.frame_count)
+                for view in targets
+                if view.archive is not None
+            )
+            if common_count <= 0:
+                return
+            active = self.active_view if self.active_view in targets else targets[0]
+            start_index = min(int(active.current_frame_index), common_count - 1)
+            # Align all panes before the first timer tick, so PLAY ALL starts
+            # visibly synchronized rather than converging one frame later.
+            if not self._load_all_views_at_index(start_index, playback=False):
+                self.status_var.set("Could not synchronize all loaded views")
+                return
+
+        self.playback_scope = scope
         self.playing = True
         self._play_generation += 1
-        # Keep pixel-value overlays active during playback when the user has
-        # enabled them. This favors inspection accuracy over maximum FPS.
-        self.canvas.set_show_values(bool(self.show_values_var.get()))
-        self.play_button.configure(text="Ⅱ  PAUSE")
-        self._schedule_next_play_frame(delay_ms=1, generation=self._play_generation)
+        for view in targets:
+            view.canvas.set_show_values(bool(view.show_values))
+        self._update_playback_buttons()
+        if scope == "all":
+            common_count = min(
+                int(view.archive.frame_count)
+                for view in targets
+                if view.archive is not None
+            )
+            self.status_var.set(
+                f"Playing ALL views in sync | {len(targets)} views | "
+                f"common range 1…{common_count} | {self.fps_var.get()} FPS"
+            )
+        else:
+            self.status_var.set(
+                f"Playing SELECTED view | View {targets[0].view_id} | "
+                f"{self.fps_var.get()} FPS"
+            )
+        self._schedule_next_play_frame(
+            delay_ms=1, generation=self._play_generation
+        )
 
     def stop_playback(self) -> None:
         self.playing = False
@@ -10141,9 +13784,9 @@ class HDXFViewerApp:
             except tk.TclError:
                 pass
             self._play_after_id = None
-        if hasattr(self, "play_button"):
-            self.play_button.configure(text="▶  PLAY")
-        self.canvas.set_show_values(bool(self.show_values_var.get()))
+        self._update_playback_buttons()
+        for view in self.views:
+            view.canvas.set_show_values(bool(view.show_values))
         if self.current_frame is not None and hasattr(self, "histogram_canvas"):
             self._update_histogram()
             self._update_image_info()
@@ -10159,24 +13802,74 @@ class HDXFViewerApp:
 
     def _play_tick(self, generation: int) -> None:
         self._play_after_id = None
-        if not self.playing or self.archive is None or generation != self._play_generation:
+        if not self.playing or generation != self._play_generation:
             return
+
         started = time.perf_counter()
-        next_index = self.current_frame_index + 1
-        if next_index >= self.archive.frame_count:
-            if self.loop_var.get():
-                next_index = 0
-            else:
+        scope = self.playback_scope
+
+        if scope == "all":
+            playable = self._playable_views()
+            if not playable:
                 self.stop_playback()
                 return
-        ok = self.load_frame(
-            next_index,
-            recompute_contrast=False,
-            sync_controls=True,
-            playback=True,
-        )
-        if not ok or not self.playing:
-            return
+            common_count = min(
+                int(view.archive.frame_count)
+                for view in playable
+                if view.archive is not None
+            )
+            if common_count <= 0:
+                self.stop_playback()
+                return
+            # PLAY ALL maintains one absolute frame index.  Using the first
+            # loaded view also keeps playback stable if the user selects an
+            # empty pane while all other panes continue playing.
+            current_index = min(int(playable[0].current_frame_index), common_count - 1)
+            next_index = current_index + 1
+            if next_index >= common_count:
+                if self.loop_var.get():
+                    next_index = 0
+                else:
+                    self.stop_playback()
+                    return
+            ok = self._load_all_views_at_index(next_index, playback=True)
+            if not ok or not self.playing:
+                self.stop_playback()
+                self.status_var.set("All-view playback stopped: a view could not be read")
+                return
+            self.status_var.set(
+                f"Playing ALL views | Image {next_index + 1} / {common_count} | "
+                f"{len(playable)} views | {self.fps_var.get()} FPS"
+            )
+        else:
+            view = self.active_view
+            if view is None or view.archive is None:
+                self.stop_playback()
+                return
+            next_index = int(view.current_frame_index) + 1
+            if next_index >= view.archive.frame_count:
+                if self.loop_var.get():
+                    next_index = 0
+                else:
+                    self.stop_playback()
+                    return
+            ok = self.load_frame(
+                next_index,
+                recompute_contrast=False,
+                sync_controls=True,
+                playback=True,
+                # Selected playback must stay selected even when the optional
+                # manual frame-sync switch is enabled.
+                notify_sync=False,
+            )
+            if not ok or not self.playing:
+                return
+            self.status_var.set(
+                f"Playing SELECTED | View {view.view_id} | "
+                f"Image {next_index + 1} / {view.archive.frame_count} | "
+                f"{self.fps_var.get()} FPS"
+            )
+
         try:
             fps = max(0.2, float(self.fps_var.get()))
         except ValueError:
@@ -11079,12 +14772,28 @@ def configure_modern_theme(root: tk.Tk, *, ui_scale: float = 1.0) -> None:
     style.map("TButton", background=[("pressed", UI_ACCENT_DARK), ("active", UI_BORDER)], foreground=[("disabled", UI_TEXT_DIM)])
     style.configure("Toolbar.TButton", background=UI_SURFACE_RAISED, foreground=UI_TEXT, **button_common)
     style.map("Toolbar.TButton", background=[("pressed", UI_ACCENT_DARK), ("active", UI_BORDER)])
+    style.configure(
+        "ToolbarMenu.TMenubutton",
+        background=UI_SURFACE_RAISED,
+        foreground=UI_TEXT,
+        font=semibold,
+        padding=(px(9), px(5)),
+        borderwidth=0,
+        relief="flat",
+    )
+    style.map(
+        "ToolbarMenu.TMenubutton",
+        background=[("pressed", UI_ACCENT_DARK), ("active", UI_BORDER)],
+        foreground=[("active", UI_WHITE)],
+    )
     style.configure("Icon.TButton", background=UI_SURFACE_RAISED, foreground=UI_TEXT, font=("Segoe UI Symbol", 10, "bold"), padding=(px(6), px(5)), borderwidth=0)
     style.map("Icon.TButton", background=[("pressed", UI_ACCENT_DARK), ("active", UI_BORDER)], foreground=[("active", UI_WHITE)])
     style.configure("Accent.TButton", background=UI_ACCENT_STRONG, foreground=UI_WHITE, **button_common)
     style.map("Accent.TButton", background=[("pressed", "#1D4ED8"), ("active", UI_ACCENT_HOVER)], foreground=[("active", UI_WHITE)])
-    style.configure("Play.TButton", background=UI_ACCENT, foreground=UI_BG, font=("Segoe UI", 9, "bold"), padding=(px(10), px(5)), borderwidth=0)
+    style.configure("Play.TButton", background=UI_ACCENT, foreground=UI_BG, font=("Segoe UI", 9, "bold"), padding=(px(9), px(5)), borderwidth=0)
     style.map("Play.TButton", background=[("pressed", UI_ACCENT_STRONG), ("active", "#7DD3FC")], foreground=[("active", UI_BG)])
+    style.configure("PlayAll.TButton", background=UI_ACCENT_STRONG, foreground=UI_WHITE, font=("Segoe UI", 9, "bold"), padding=(px(8), px(5)), borderwidth=0)
+    style.map("PlayAll.TButton", background=[("pressed", UI_ACCENT_DARK), ("active", UI_ACCENT_HOVER)], foreground=[("active", UI_WHITE)])
     style.configure("Secondary.TButton", background=UI_CARD_ALT, foreground=UI_TEXT, **button_common)
     style.map("Secondary.TButton", background=[("pressed", UI_ACCENT_DARK), ("active", UI_BORDER)])
     style.configure("Converter.Horizontal.TProgressbar", troughcolor=UI_CARD_ALT, background=UI_ACCENT, bordercolor=UI_CARD_ALT, lightcolor=UI_ACCENT, darkcolor=UI_ACCENT, thickness=px(16))
