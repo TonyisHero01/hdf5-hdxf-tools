@@ -16,6 +16,7 @@ describe the newly summed image.
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 import base64
 import bisect
 import gc
@@ -1392,6 +1393,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Frame numbers are 1-based."
         )
     )
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdxf_sum", output_archive_format=FORMAT_VERSION))
     parser.add_argument("-i", "--input", type=Path, nargs="+", help="Input .hdxf file(s)")
     parser.add_argument("-d", "--input-dir", type=Path, default=None, help="Directory to scan for HDXF files")
     parser.add_argument("--recursive", action="store_true", help="Scan input directory recursively")

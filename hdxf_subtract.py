@@ -30,6 +30,7 @@ compatible with the project's current HDXFB version and compression policy.
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 import bisect
 import copy
 import hashlib
@@ -1965,6 +1966,8 @@ def build_parser() -> argparse.ArgumentParser:
             "range/ROI processing, and write a new HDXF archive."
         )
     )
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdxf_subtract", tool_version=SCRIPT_VERSION))
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("-i", "--input", type=Path, help="Input .hdxf archive")
     source.add_argument(

@@ -30,6 +30,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 import base64
 import csv
 import io
@@ -194,7 +195,9 @@ from tkinter import font as tkfont
 
 FORMAT_NAME = "HDF5-derived Detector eXchange Format"
 FORMAT_ID = "hdxf"
-FORMAT_VERSION = "0.4.8.0"
+VIEWER_VERSION = "0.4.8.0"
+# Deprecated alias for historical imports; this is a Viewer build, not an archive format.
+FORMAT_VERSION = VIEWER_VERSION
 SUPPORTED_FORMAT_VERSIONS = {
     "0.3.0", "0.4.0", "0.4.2", "0.4.3", "0.4.4", "0.4.5",
     "0.4.6", "0.4.7", "0.4.8"
@@ -8246,9 +8249,7 @@ class HDXFViewerApp:
         self.processing_zstd_level_var = tk.StringVar(value="3")
         self.processing_verify_var = tk.BooleanVar(value=True)
 
-        # Scalar Pixel Operation controls. Keep the CLI spelling used by
-        # hdxf_pixelop.py (including --multiple / --devide) in the command
-        # builder while presenting normal English labels in the UI.
+        # Scalar Pixel Operation controls use the --divide spelling.
         self.processing_pixelop_operation_var = tk.StringVar(value="Add")
         self.processing_pixelop_value_var = tk.StringVar(value="0")
         self.processing_pixelop_roi_var = tk.StringVar()
@@ -8912,7 +8913,7 @@ class HDXFViewerApp:
                 "Add": "--add",
                 "Subtract": "--subtract",
                 "Multiply": "--multiple",
-                "Divide": "--devide",
+                "Divide": "--divide",
             }.get(operation)
             if flag is None:
                 raise HDXFViewerError(f"unknown Pixel Op operation: {operation}")
@@ -14860,6 +14861,8 @@ def create_application_root() -> tk.Tk:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Albula-inspired HDXF/HDF5 desktop viewer v0.4.8.0 HDF5 + SUM/SUB/PIXEL build")
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdxf_viewer", tool_version=VIEWER_VERSION))
     parser.add_argument("hdxf", nargs="?", type=Path, help="Optional .hdxf file")
     return parser
 

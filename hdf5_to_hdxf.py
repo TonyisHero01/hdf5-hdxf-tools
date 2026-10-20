@@ -18,6 +18,7 @@ Conversion-host details are not added to the source metadata.
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 import base64
 import csv
 import faulthandler
@@ -5278,6 +5279,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert HDF5 detector masters to HDXF v0.4.8 with exact Attribute-schema restoration and conservative automatic auxiliary reconstruction",
     )
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdf5_to_hdxf", tool_version=TOOL_VERSION,
+        output_archive_format=FORMAT_VERSION))
     parser.add_argument("input", type=Path, help="Input master file or directory containing masters")
     parser.add_argument("-o", "--output", type=Path, help="Output .hdxf file, or output directory for batch input")
     parser.add_argument(

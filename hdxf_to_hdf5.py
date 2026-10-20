@@ -19,6 +19,7 @@ Optional but strongly recommended for preserving detector HDF5 filters:
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import base64
@@ -1832,6 +1833,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Restore HDXF to the original HDF5 master + external files. Optimized for HDXF 0.4.8 embedded-master archives; older source=input-master archives remain supported."
     )
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdxf_to_hdf5", build=RESTORE_BUILD))
     parser.add_argument("input", type=Path, help="Input .hdxf archive")
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output HDF5 files")

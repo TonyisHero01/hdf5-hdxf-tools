@@ -8,7 +8,7 @@ preserves the original arithmetic flag names and selection semantics:
 * --add X       : add X to every selected pixel
 * --subtract X  : subtract X from every selected pixel
 * --multiple X  : multiply every selected pixel by X
-* --devide X    : divide every selected pixel by X
+* --divide X    : divide every selected pixel by X
 * --roi x1,y1,x2,y2 : restrict the arithmetic operation to an inclusive ROI
 * --frame_from / --frame_to / --select-frame : global 1-based frame selection
 
@@ -36,6 +36,7 @@ hdf5_to_hdxf.py supplies the canonical HDXFB encoder used by this project.
 from __future__ import annotations
 
 import argparse
+from hdxf_release import version_banner
 import bisect
 import copy
 import hashlib
@@ -597,9 +598,9 @@ def _apply_pixel_operation(array: np.ndarray, config: TransformConfig) -> np.nda
             return work.astype(dtype, copy=False)
         return (array.astype(np.float64) * value).astype(dtype, copy=False)
 
-    if config.operation == "devide":
+    if config.operation == "divide":
         if value == 0.0:
-            raise HDXFProcessError("--devide value must be non-zero")
+            raise HDXFProcessError("--divide value must be non-zero")
         if is_int:
             work = np.rint(array.astype(np.float64) / value)
             info = np.iinfo(dtype)
@@ -1146,17 +1147,17 @@ def _selected_operation(args: argparse.Namespace) -> tuple[str, float]:
         ("add", args.add),
         ("subtract", args.subtract),
         ("multiple", args.multiple),
-        ("devide", args.devide),
+        ("divide", args.divide),
     ]
     chosen = [(name, value) for name, value in operations if value is not None]
     if len(chosen) != 1:
         raise HDXFProcessError(
-            "Exactly one of --add/--subtract/--multiple/--devide must be provided"
+            "Exactly one of --add/--subtract/--multiple/--divide must be provided"
         )
     operation, value = chosen[0]
     assert value is not None
-    if operation == "devide" and float(value) == 0.0:
-        raise HDXFProcessError("--devide value must be non-zero")
+    if operation == "divide" and float(value) == 0.0:
+        raise HDXFProcessError("--divide value must be non-zero")
     return operation, float(value)
 
 
@@ -1220,7 +1221,7 @@ def _operation_label(
         "add": "ADD",
         "subtract": "SUB",
         "multiple": "MUL",
-        "devide": "DIV",
+        "divide": "DIV",
     }[operation]
     parts = [f"{tag}_{_format_operation_value(value)}"]
     if roi is not None:
@@ -1914,6 +1915,8 @@ def build_parser() -> argparse.ArgumentParser:
             "detector frames and write a new self-contained HDXF archive."
         )
     )
+    parser.add_argument("--version", action="version", version=version_banner(
+        "hdxf_pixelop", tool_version=SCRIPT_VERSION))
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("-i", "--input", type=Path, help="Input .hdxf archive")
     source.add_argument(
@@ -1967,7 +1970,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--add", type=float, default=None, help="Add this value to each selected pixel")
     parser.add_argument("--subtract", type=float, default=None, help="Subtract this value from each selected pixel")
     parser.add_argument("--multiple", type=float, default=None, help="Multiply each selected pixel by this value")
-    parser.add_argument("--devide", type=float, default=None, help="Divide each selected pixel by this value")
+    parser.add_argument("--divide", type=float, default=None,
+                        help="Divide each selected pixel by this value")
     parser.add_argument(
         "--roi",
         type=str,

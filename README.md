@@ -1,381 +1,124 @@
 # HDF5 and HDXF Universal Tools
 
-A collection of utilities for working with **HDF5** and **HDXF** scientific detector data.
+Desktop viewing, lossless conversion, and frame processing for scientific HDF5/NeXus detector data and **HDXF** archives.
 
-The project includes:
+**Current software-suite version:** `0.4.8` (source snapshot; see [VERSIONS.md](VERSIONS.md)). This is **not** a claim that every auxiliary tool writes or accepts archive format `0.4.8`.
 
-- **HDXF Viewer** — a desktop GUI for opening, visualizing, and analyzing HDF5 and HDXF detector frames.
-- **HDF5 / HDXF Converters** — lossless conversion between HDF5 and HDXF formats.
-- **HDF5 / HDXF Structure Explorer** — inspection and comparison of HDF5 and HDXF internal structures.
-- **Scientific Analysis** — ROI tools, pixel operations, frame summation, subtraction, and pyFAI 1D/2D integration.
-- **Hardware Auto-Tuning** — adaptive CPU and memory management.
-- **Optional NVIDIA CUDA 12 Acceleration** — GPU-accelerated processing for supported operations.
+## Included in this repository
 
----
+| Tool | File | What it does |
+| --- | --- | --- |
+| HDXF Viewer | `hdxf_viewer.py` | Desktop GUI for HDF5/HDXF frame navigation, pixel inspection, ROI tools, beam center, resolution rings, pyFAI 1D/2D integration, and the separate Notebook-reference radial calculation |
+| HDF5 → HDXF | `hdf5_to_hdxf.py` | Archive detector data and metadata in HDXF |
+| HDXF → HDF5 | `hdxf_to_hdf5.py` | Reconstruct the HDF5 master and associated data files |
+| HDXF operations | `hdxf_sum.py`, `hdxf_subtract.py`, `hdxf_pixelop.py` | Sum/mean/exposure-normalized output, filtering/subtraction, and scalar arithmetic |
+| HDF5 operations | `hdf5_processing_tree.py` | HDF5 frame processing while retaining the relevant HDF5 structure |
+| Core libraries | `hdxf_codec.py`, `hdxf_index.py`, `hdxf_hardware.py`, `hdxf_notebook_reference.py`, `hdxf_release.py` | Codec, indexing, hardware guidance, Notebook reference, and release metadata |
+
+**Not included:** There is **no separate `hdf5_hdxf_structure_explorer.py`** in the current repository. The Viewer has its own metadata/data browsing functions; an independent Structure Explorer is not part of this distribution.
+
+**Scope of supported features:** The Viewer has a PONI/pyFAI geometry interface, but a dedicated detector-tilt correction workflow is not yet released. The Notebook-reference mode provides configurable gap-row exclusions; do not treat them as a validated automatic module-gap mask for every detector. Image exports to JPEG/PNG, per-frame direct-beam normalization, and a generalized geometry-correction workflow are planned, not features promised by this snapshot.
 
 ## Requirements
 
-- Python 3.13 recommended for the current pinned dependencies
-- pip
-- Windows 11 or a compatible Linux distribution
-- Tkinter for the desktop GUI
-- NVIDIA GPU with a compatible driver for optional CUDA acceleration
+- **64-bit CPython 3.13** is the target for the current pinned Python packages; other Python versions are not covered by these pins.
+- Windows 11 or a compatible Linux desktop with Tk/Tkinter.
+- Enough available RAM and disk space for the chosen detector archive.
+- An NVIDIA GPU and compatible driver **only** for optional CUDA operations.
 
-On Windows, Tkinter is normally included with the standard Python installer.
-
-On Ubuntu, install the system packages:
+For Ubuntu, install the platform-provided Tk and venv packages (with matching Python versions):
 
 ```bash
 sudo apt update
 sudo apt install python3-venv python3-tk
 ```
 
----
+## Install (CPU / standard)
 
-## Installation
-
-### 1. Create a virtual environment
-
-**Windows PowerShell**
-
-```powershell
-py -3.13 -m venv venv
-```
-
-**Linux**
-
-```bash
-python3 -m venv venv
-```
-
-### 2. Activate the virtual environment
-
-**Windows PowerShell**
-
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-**Linux**
-
-```bash
-source venv/bin/activate
-```
-
-After activation, the terminal should display the environment name:
-
-```text
-(venv)
-```
-
-### 3. Install dependencies
-
-Upgrade pip:
-
-```bash
-python -m pip install --upgrade pip
-```
-
-Install the project dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Verify the installation:
-
-```bash
-python -m pip check
-```
-
-**Important:** Always activate the virtual environment before installing dependencies.
-
-Alternatively, use the virtual environment's Python executable directly to ensure packages are installed in the correct environment.
-
----
-
-## GPU Support (Optional)
-
-HDXF supports optional NVIDIA CUDA acceleration through CuPy.
-
-GPU acceleration is available for supported processing operations, including CUDA-based frame transformations during conversion and restoration.
-
-### Requirements
-
-- A compatible NVIDIA GPU
-- An NVIDIA driver compatible with CUDA 12
-- The CUDA 12 Python dependencies
-- Sufficient available GPU memory
-
-### Installation
-
-With the virtual environment activated, run:
-
-```bash
-python -m pip install -r requirements_gpu_cuda12.txt
-```
-
-This requirements file includes the standard project dependencies and the CUDA 12 CuPy package.
-
-### Verify GPU availability
-
-```bash
-nvidia-smi
-```
-
-Verify CUDA access from Python:
-
-```bash
-python -c "import cupy as cp; print('CUDA devices:', cp.cuda.runtime.getDeviceCount())"
-```
-
-GPU support is optional. HDXF can run with its CPU backend without a compatible NVIDIA GPU.
-
----
-
-## Run the Applications
-
-### HDXF Viewer (GUI)
-
-Launch the desktop Viewer:
-
-```bash
-python hdxf_viewer.py
-```
-
-The graphical interface opens in a desktop window.
-
-The Viewer supports:
-
-- Opening HDF5 and HDXF detector files
-- Frame navigation and visualization
-- Zooming, panning, and pixel inspection
-- Multiple synchronized views
-- Beam-center selection and resolution rings
-- ROI creation and editing
-- Histogram and contrast controls
-- pyFAI 1D and 2D integration
-- Notebook-reference radial analysis
-- Detector frame processing
-- HDF5 ↔ HDXF conversion tools
-
-A graphical desktop environment is required to display the GUI.
-
-### HDF5 / HDXF Structure Explorer
-
-If the separate Structure Explorer script is included in your installation, launch it with:
-
-```bash
-python hdf5_hdxf_structure_explorer.py
-```
-
----
-
-## HDF5 / HDXF Structure Explorer
-
-The Structure Explorer is designed to inspect and compare the organization of scientific detector datasets.
-
-A typical HDF5 detector dataset consists of a Master HDF5 file and one or more external Data HDF5 files.
-
-### HDF5 View
-
-The explorer can display:
-
-- Master HDF5 structure
-- External Data HDF5 files
-- Merged logical HDF5 structure
-- Groups and datasets
-- Dataset attributes
-- Soft links and external links
-- Dataset shapes and data types
-- Chunk layout
-- Compression and HDF5 filters
-- Logical and physical storage sizes
-- Dataset occurrences across physical HDF5 files
-
-Typical detector paths include:
-
-```text
-/entry/instrument/detector
-/entry/instrument/beam
-/entry/instrument/detector/calibration
-/entry/detector
-/entry/image
-/entry/roi
-/entry/xfel
-```
-
-### HDXF View
-
-The explorer can inspect:
-
-- HDXF overview
-- Logical HDF5 object graph
-- Archived objects grouped by original source file
-- Legacy HDF5 reconstruction information
-- Detector frame archives
-- Payload and archive members
-- `manifest.json`
-
-HDF5 and HDXF structures can be displayed side by side.
-
-### Cross-Highlighting
-
-Selecting a mapped object in one view can highlight the corresponding object in the other view.
-
-For physical HDF5 files, matching uses:
-
-```text
-source file + HDF5 path
-```
-
-This prevents objects with identical internal paths in different Data HDF5 files from being incorrectly treated as the same physical object.
-
----
-
-## Recommended Project Layout
-
-```text
-hdf5-hdxf-tools/
-│
-├── hdxf_viewer.py
-├── hdxf_codec.py
-├── hdxf_index.py
-├── hdxf_hardware.py
-├── hdxf_notebook_reference.py
-│
-├── hdf5_to_hdxf.py
-├── hdxf_to_hdf5.py
-├── hdf5_processing_tree.py
-│
-├── hdxf_sum.py
-├── hdxf_subtract.py
-├── hdxf_pixelop.py
-│
-├── hdf5_hdxf_structure_explorer.py
-│
-├── requirements.txt
-├── requirements_gpu_cuda12.txt
-├── README.md
-│
-└── venv/
-```
-
-Some tools are optional and may be distributed separately.
-
-Keep shared Python modules in the locations expected by the application imports.
-
----
-
-## Quick Start
+For step-by-step Windows troubleshooting, see **[INSTALL_WINDOWS.md](INSTALL_WINDOWS.md)**.
 
 ### Windows PowerShell
 
-```powershell
-# Create virtual environment
-py -3.13 -m venv venv
-
-# Activate
-.\venv\Scripts\Activate.ps1
-
-# Install dependencies
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-
-# Launch HDXF Viewer GUI
-python hdxf_viewer.py
-```
-
-### Ubuntu / Linux
-
-```bash
-# Install system dependencies
-sudo apt update
-sudo apt install python3-venv python3-tk
-
-# Create virtual environment
-python3 -m venv venv
-
-# Activate
-source venv/bin/activate
-
-# Install dependencies
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-
-# Launch HDXF Viewer GUI
-python hdxf_viewer.py
-```
-
-For GPU-enabled installation, refer to the **GPU Support** section above.
-
----
-
-## Troubleshooting
-
-### PowerShell blocks virtual-environment activation
-
-If PowerShell refuses to run `Activate.ps1`, use:
+Open PowerShell **inside the folder containing `requirements.txt`**, then run:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\venv\Scripts\Activate.ps1
-```
-
-This changes the execution policy only for the current PowerShell session.
-
-### ModuleNotFoundError
-
-If a required module such as NumPy cannot be found, verify the active Python environment:
-
-```bash
-python -c "import sys; print(sys.executable)"
-python -m pip --version
-```
-
-Both should point to your virtual environment.
-
-Reinstall project dependencies if necessary:
-
-```bash
+python --version
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-### HDF5 filter errors
-
-Some detector datasets require external HDF5 compression filters, including Bitshuffle/LZ4.
-
-Make sure `hdf5plugin` is installed:
-
-```bash
-python -m pip show hdf5plugin
-```
-
-### Verify installed dependencies
-
-```bash
 python -m pip check
 ```
 
-### Close the virtual environment
+Confirm that `python --version` reports Python 3.13 before creating the environment. If PowerShell blocks activation, see the Windows guide. Avoid installing into the global Python environment: activate `.venv` **before** installing.
+
+### Ubuntu / Linux
+
+Use an installed, compatible Python 3.13 executable (adjust its name to your system):
 
 ```bash
-deactivate
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip check
 ```
 
----
+## Optional CUDA 12 installation
 
-## Notes
+This is **optional**; the CPU paths are usable without it. CUDA acceleration applies to supported processing paths, not all Viewer or pyFAI operations.
 
-- Keep Master HDF5 files and their associated external Data HDF5 files accessible when working with complete detector datasets.
-- HDXF is designed for lossless scientific detector-data archiving.
-- The Viewer and converters use shared HDXF codec and index modules.
-- Filtered detector datasets should only be decoded when necessary.
-- GPU acceleration availability depends on hardware, drivers, and the selected processing operation.
-- Exact scientific data preservation and reconstruction are important design goals of the project.
+After installing and activating the base environment:
 
----
+```bash
+python -m pip install -r requirements_gpu_cuda12.txt
+nvidia-smi
+python -c "import cupy as cp; print('CUDA devices:', cp.cuda.runtime.getDeviceCount())"
+```
+
+`requirements_gpu_cuda12.txt` already includes `requirements.txt`; it may be used directly for a fresh GPU-enabled environment. Your NVIDIA driver must support the selected CUDA runtime. CuPy installation alone does not ensure an available CUDA device.
+
+## Start the Viewer GUI
+
+Run from the project directory in the active virtual environment:
+
+```bash
+python hdxf_viewer.py
+```
+
+A graphical desktop session is required. You can also supply a file path as an optional argument: `python hdxf_viewer.py --help` documents invocation details.
+
+## Command-line tools
+
+These tools are shipped in the same directory as the core modules. Query their supported options before processing data:
+
+```bash
+python hdf5_to_hdxf.py --help
+python hdxf_to_hdf5.py --help
+python hdxf_sum.py --help
+python hdxf_subtract.py --help
+python hdxf_pixelop.py --help
+python hdf5_processing_tree.py --help
+```
+
+For a uniform software version query, each runnable script also supports `--version`. **The HDXF archive format version, its binary frame-block (`HDXFB`) version, and each tool's build/version are distinct**; see [VERSIONS.md](VERSIONS.md).
+
+Pixel division uses the `--divide` argument exclusively. Existing commands must use this spelling.
+
+**Compatibility caution:** The included `hdxf_sum.py`, `hdxf_subtract.py`, and `hdxf_pixelop.py` have older archive-version acceptance policies than the current 0.4.8 converter. Do not assume every old processing tool supports HDXF 0.4.8. Consult [VERSIONS.md](VERSIONS.md) before processing newly created archives.
+
+## Detector data notes
+
+- HDF5 master files may reference separate external data files; preserve their relative links or use the converter's documented external-root support.
+- `hdf5plugin` registers detector compression filters such as Bitshuffle/LZ4. File metadata may be readable even when pixel decoding fails because a filter is missing.
+- HDXF encoding aims to preserve detector data losslessly; use `--verify` where supported and retain original source files until restoration has been checked.
+- JPEG and display-oriented PNG are not substitutes for original scientific arrays when numerical precision matters.
+- Use the Notebook-reference radial mode only when its geometry, beam center, masks, and averaging assumptions are appropriate for your experiment; it is not identical to pyFAI integration.
+
+## Release history
+
+Changes to the repository and compatibility notes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-Add the project license here.
+No license file is included in this uploaded repository snapshot. A project license must be chosen and added before inviting others to reuse or redistribute the source under explicit terms.

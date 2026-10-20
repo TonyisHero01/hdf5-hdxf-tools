@@ -33,6 +33,7 @@ from __future__ import annotations
 
 
 import argparse
+from hdxf_release import version_banner
 
 import hashlib
 
@@ -1584,6 +1585,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--exact-value",
         help="replace pixels exactly equal to this original detector value; integer matching is precision-safe",
     )
+    parser.add_argument("--version", action="version", version=version_banner("hdf5_processing_tree"))
 
     parser.add_argument("--upper-threshold", type=float)
 
