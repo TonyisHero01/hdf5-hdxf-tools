@@ -36,6 +36,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
+from hdxf_normalization import (
+    NormalizationError, beam_roi_intensity, load_beam_mask,
+    monitor_scalar, normalized_sum, validate_normalization_options,
+)
 
 from hdxf_codec import (
     HDXFBError,
@@ -77,6 +81,8 @@ OPERATION_TAGS = {
     "sum": "SUM",
     "mean": "MEAN",
     "exposure-normalized": "RATE",
+    "i0-normalized": "I0",
+    "beam-normalized": "BEAM",
 }
 
 EXPOSURE_PATHS = (
@@ -926,6 +932,7 @@ def _apply_operation(
     operation: str,
     frame_count: int,
     exposure_total: float | None,
+    monitor_total: float | None = None,
 ) -> tuple[np.ndarray, str]:
     source = np.asarray(accumulator)
     if operation == "sum":
@@ -942,6 +949,10 @@ def _apply_operation(
             )
         return source.astype(np.float64, copy=False) / float(exposure_total), (
             f"exposure-normalized rate using {exposure_total:.12g} s (counts/s)"
+        )
+    if operation in ("i0-normalized", "beam-normalized"):
+        return normalized_sum(source, monitor_total or 0.0, label=operation), (
+            f"{operation} from summed frame counts and monitor={monitor_total:.12g}"
         )
     raise HDXFSumError(f"Unsupported operation: {operation}")
 
@@ -1420,7 +1431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--operation",
-        choices=("sum", "mean", "exposure-normalized"),
+        choices=("sum", "mean", "exposure-normalized", "i0-normalized", "beam-normalized"),
         default="sum",
         help=(
             "Output operation. sum keeps total counts; mean divides by selected frame "
@@ -1428,6 +1439,10 @@ def build_parser() -> argparse.ArgumentParser:
             "outputs counts/s. Default: sum"
         ),
     )
+    parser.add_argument("--i0-path", default="", help="Absolute original HDF5 Dataset path of the I0 monitor")
+    parser.add_argument("--beam-roi", default="", help="x,y,width,height (0-based detector pixels)")
+    parser.add_argument("--beam-saturation", type=float, default=None, help="First saturated detector count; required for beam-normalized")
+    parser.add_argument("--beam-mask", type=Path, default=None, help="Optional .npy bool exclusion mask for beam ROI")
     parser.add_argument(
         "--out-dtype",
         default="auto",
@@ -1494,6 +1509,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             else:
                 print(f"[SELECT M{index}] 0 frames", flush=True)
+
+        beam_roi = validate_normalization_options(
+            args.operation, i0_path=args.i0_path, beam_roi=args.beam_roi,
+            beam_saturation=args.beam_saturation, frame_shape=first.frame_shape,
+        )
+        beam_exclusion = load_beam_mask(args.beam_mask, first.frame_shape) if args.operation == "beam-normalized" else None
+        monitor_total = 0.0
 
         acc_dtype = _choose_acc_dtype(first.dtype, total_selected)
         output_dtype, dtype_note = _choose_output_dtype(
@@ -1568,6 +1590,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             for block_doc, block, local_indices in plan.reader.iter_selected_blocks(plan.selected):
                 selected_block = block[np.asarray(local_indices, dtype=np.int64)]
+                if args.operation == "i0-normalized":
+                    for local_block_index in local_indices:
+                        frame_index = int(block_doc["global_start_frame"]) + int(local_block_index)
+                        reading = plan.reader.metadata_value_for_frame(args.i0_path, frame_index)
+                        if reading is None:
+                            raise HDXFSumError(f"Missing I0 {args.i0_path} in {plan.reader.path.name}, frame {frame_index+1}")
+                        monitor_total += monitor_scalar(reading, label=f"I0 frame {frame_index+1}")
+                elif args.operation == "beam-normalized":
+                    assert beam_roi is not None
+                    monitor_total += math.fsum(
+                        beam_roi_intensity(frame, beam_roi, saturation=args.beam_saturation,
+                                           exclude_mask=beam_exclusion)
+                        for frame in selected_block
+                    )
                 block_sum = selected_block.sum(axis=0, dtype=acc_dtype)
                 np.add(accumulator, block_sum, out=accumulator, casting="unsafe")
                 processed += len(local_indices)
@@ -1593,6 +1629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             operation=args.operation,
             frame_count=total_selected,
             exposure_total=exposure_total,
+            monitor_total=monitor_total,
         )
         print(f"[OPERATION] {args.operation}: {operation_note}", flush=True)
         output_frame, clipped_pixels = _safe_cast_output(
@@ -1624,6 +1661,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             operation=args.operation,
             selected_frame_count=total_selected,
         )
+        if args.operation in ("i0-normalized", "beam-normalized"):
+            # Derived metadata is manifest-only; never modify original sources.
+            manifest["normalization"] = {
+                "operation": args.operation,
+                "definition": "sum(detector_counts) / sum(monitor_values)",
+                "monitor_total": float(monitor_total),
+                "selected_frames": int(total_selected),
+                "reference": args.i0_path if args.operation == "i0-normalized" else {
+                    "beam_roi": args.beam_roi,
+                    "saturation": float(args.beam_saturation),
+                    "mask": str(args.beam_mask) if args.beam_mask else None,
+                },
+            }
         _write_output_archive(
             output_path,
             first_reader=first,

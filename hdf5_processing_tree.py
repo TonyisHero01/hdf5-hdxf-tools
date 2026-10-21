@@ -36,6 +36,7 @@ import argparse
 from hdxf_release import version_banner
 
 import hashlib
+import math
 
 from decimal import Decimal, InvalidOperation
 
@@ -70,6 +71,10 @@ except Exception:
 import h5py
 
 import numpy as np
+from hdxf_normalization import (
+    NormalizationError, beam_roi_intensity, load_beam_mask, monitor_scalar,
+    normalized_sum, validate_normalization_options,
+)
 
 
 
@@ -517,7 +522,7 @@ def _output_dtype(operation: str, source_dtype: np.dtype, requested: str, count:
 
         return np.dtype(source_dtype)
 
-    if operation in ("mean", "exposure-normalized"):
+    if operation in ("mean", "exposure-normalized", "i0-normalized", "beam-normalized"):
 
         return np.dtype("float64")
 
@@ -723,7 +728,7 @@ def _reduce_side_dataset(path: str, values: list[np.ndarray], operation: str, dt
 
         elif name in TIME_NAMES:
 
-            reduced = combined.sum(axis=0, dtype=np.float64) if operation in ("sum", "exposure-normalized") else combined.mean(axis=0, dtype=np.float64)
+            reduced = combined.sum(axis=0, dtype=np.float64) if operation in ("sum", "exposure-normalized", "i0-normalized", "beam-normalized") else combined.mean(axis=0, dtype=np.float64)
 
         else:
 
@@ -815,6 +820,36 @@ def _reduce_template_file(
 
 
 
+def _monitor_values_from_hdf5(
+    master: Path, source: FrameSource, local_indices: list[int],
+    path: str, *, total_frames: int,
+) -> list[float]:
+    """Resolve the explicit I0 Dataset (per-frame or global) without guessing."""
+    # Prefer the physical data file for per-source monitors. Master-wide arrays
+    # must be indexed by global frames, and scalars represent one reading/frame.
+    candidates = [source.file_path]
+    if source.file_path != master:
+        candidates.append(master)
+    for filepath in candidates:
+        with h5py.File(filepath, "r") as handle:
+            obj = handle.get(path)
+            if not isinstance(obj, h5py.Dataset):
+                continue
+            shape = obj.shape
+            if shape == () or obj.size == 1:
+                scalar = monitor_scalar(obj[()], label=f"I0 {filepath.name}:{path}")
+                return [scalar] * len(local_indices)
+            if (filepath == source.file_path or total_frames == source.frame_count) and shape[0] == source.frame_count:
+                return [monitor_scalar(obj[i], label=f"I0 {filepath.name}:{path} frame {i+1}") for i in local_indices]
+            if filepath == master and shape[0] == total_frames:
+                return [monitor_scalar(obj[source.global_start+i], label=f"I0 {filepath.name}:{path} global frame {source.global_start+i+1}") for i in local_indices]
+            raise NormalizationError(
+                f"I0 {filepath.name}:{path}: shape {shape} does not match "
+                f"source frames={source.frame_count} or total frames={total_frames}"
+            )
+    raise NormalizationError(f"I0 Dataset not found: {path}. Specify a real monitor Dataset path")
+
+
 def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path, sources: list[FrameSource], indices: list[int]) -> None:
 
     by_source = _selection_by_source(sources, indices)
@@ -828,6 +863,14 @@ def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path
     done = 0
 
     exposure_total = 0.0
+    beam_roi = validate_normalization_options(
+        operation, i0_path=getattr(args, "i0_path", ""),
+        beam_roi=getattr(args, "beam_roi", ""),
+        beam_saturation=getattr(args, "beam_saturation", None),
+        frame_shape=sources[0].frame_shape,
+    )
+    beam_exclusion = load_beam_mask(getattr(args, "beam_mask", None), sources[0].frame_shape) if operation == "beam-normalized" else None
+    monitor_total = 0.0
 
     for source in sources:
 
@@ -838,6 +881,19 @@ def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path
             continue
 
         block = _read_local_frames(source, local)
+        # Fail before writing any output if the I0/beam reference is invalid.
+        if operation == "i0-normalized":
+            monitor_total += math.fsum(_monitor_values_from_hdf5(
+                master, source, local, args.i0_path,
+                total_frames=sum(s.frame_count for s in sources),
+            ))
+        elif operation == "beam-normalized":
+            assert beam_roi is not None
+            monitor_total += math.fsum(
+                beam_roi_intensity(frame, beam_roi, saturation=args.beam_saturation,
+                                   exclude_mask=beam_exclusion)
+                for frame in block
+            )
 
         accumulator += block.sum(axis=0, dtype=accumulator.dtype)
 
@@ -890,6 +946,10 @@ def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path
             raise ProcessingError("exposure-normalized output requires positive exposure/count_time metadata")
 
         accumulator = accumulator / exposure_total
+    elif operation in ("i0-normalized", "beam-normalized"):
+        accumulator = normalized_sum(accumulator, monitor_total, label=operation)
+        print(f"[NORMALIZATION] {operation} denominator={monitor_total:.12g} "+
+              f"frames={len(indices)} (sum counts / sum monitor)", flush=True)
 
     result = _cast_pixels(accumulator, dtype)
 
@@ -1027,7 +1087,7 @@ def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path
 
             if isinstance(obj, h5py.Dataset) and obj.shape == () and exposure_total > 0:
 
-                value = exposure_total if operation in ("sum", "exposure-normalized") else exposure_total / len(indices)
+                value = exposure_total if operation in ("sum", "exposure-normalized", "i0-normalized", "beam-normalized") else exposure_total / len(indices)
 
                 try:
 
@@ -1038,6 +1098,18 @@ def process_sum_mean(args: argparse.Namespace, master: Path, output_master: Path
                     pass
 
 
+
+    if operation in ("i0-normalized", "beam-normalized"):
+        with h5py.File(output_data, "r+") as out_data:
+            frame_dataset = out_data[first.dataset_path]
+            frame_dataset.attrs["hdxf_normalization_mode"] = operation
+            frame_dataset.attrs["hdxf_normalization_denominator"] = float(monitor_total)
+            frame_dataset.attrs["hdxf_normalization_frames"] = int(len(indices))
+            frame_dataset.attrs["hdxf_normalization_definition"] = "sum(detector_counts) / sum(monitor_values)"
+            frame_dataset.attrs["hdxf_normalization_reference"] = (
+                args.i0_path if operation == "i0-normalized"
+                else f"ROI={args.beam_roi}; saturation={args.beam_saturation}; mask={args.beam_mask or 'none'}"
+            )
 
     verify_sum_tree(master, output_master, first.file_path, output_data, {source.link_name for source in sources})
 
@@ -1555,13 +1627,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("-o", "--output", required=True, type=Path, help="output master HDF5")
 
-    parser.add_argument("--mode", choices=("sum", "mean", "exposure-normalized", "pixelop", "filter"), required=True)
+    parser.add_argument("--mode", choices=("sum", "mean", "exposure-normalized", "i0-normalized", "beam-normalized", "pixelop", "filter"), required=True)
 
     parser.add_argument("--frame-from", type=int)
 
     parser.add_argument("--frame-to", type=int)
 
     parser.add_argument("--select-frame")
+
+    parser.add_argument("--i0-path", default="", help="Absolute HDF5 Dataset path of I0 monitor, scalar or one value per frame")
+    parser.add_argument("--beam-roi", default="", help="x,y,width,height in detector pixels (0-based)")
+    parser.add_argument("--beam-saturation", type=float, default=None, help="First saturated detector count; required for beam-normalized")
+    parser.add_argument("--beam-mask", type=Path, default=None, help="Optional .npy bool mask, True=excluded from beam reference")
 
     parser.add_argument("--out-dtype", default="auto", choices=("auto", "source", "int16", "int32", "int64", "uint16", "uint32", "uint64", "float32", "float64"))
 
@@ -1627,7 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[SELECT] {len(indices)} frames", flush=True)
 
-    if args.mode in ("sum", "mean", "exposure-normalized"):
+    if args.mode in ("sum", "mean", "exposure-normalized", "i0-normalized", "beam-normalized"):
 
         args.operation = args.mode
 

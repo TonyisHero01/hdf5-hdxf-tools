@@ -12,7 +12,7 @@ Features:
   - Frame navigation
   - Mouse-wheel zoom centered under the cursor
   - Mouse-drag pan
-  - Temporary manual beam-center anchor: Ctrl+left click to set, right click to clear
+  - Right-click menu: set/clear beam center and mask/unmask detector pixels or ROI
   - Direct pixel edit: double-left-click one pixel, type a replacement value, press Enter
   - pyFAI current-frame 1D/2D integration, PONI load/save and control-point geometry refinement
   - Multi-shape ROI: Rectangle, Ellipse, Circle, Annulus, Polygon and Freehand using the right mouse button
@@ -52,7 +52,18 @@ import time
 import traceback
 import zipfile
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from hdxf_bright_spots import BrightSpotOptions, detect_bright_spots
+from hdxf_geometry import (ONE_D_AXES, CORRECTED_THETA, get_1d_axis_spec,
+                           format_1d_axis, two_theta_degrees, color_geometry_map)
+from hdxf_module_gaps import GapMaskError, metadata_module_proposal, manual_gap_proposal, image_stripe_gap_proposal
+from hdxf_image_export import (
+    EXPORT_FORMATS, JPG_DISPLAY, NPY_RAW, PNG_DISPLAY, PNG_UINT16,
+    OverlayState, export_frame, file_extension, frame_filename, frame_indices,
+)
+from hdxf_mask_comparison import TRACKS as NOTEBOOK_COMPARE_TRACKS, make_mask_comparison
+from hdxf_plot_export import export_integration_chart
+from dataclasses import dataclass, field, replace, replace
 from pathlib import Path
 from typing import Any
 
@@ -2923,6 +2934,9 @@ class ImageCanvas(tk.Canvas):
         roi_callback=None,
         pixel_edit_callback=None,
         calibration_point_callback=None,
+        mask_callback=None,
+        bright_spots_callback=None,
+        gap_mask_callback=None,
     ) -> None:
         super().__init__(
             master,
@@ -2938,6 +2952,9 @@ class ImageCanvas(tk.Canvas):
         self.roi_callback = roi_callback
         self.pixel_edit_callback = pixel_edit_callback
         self.calibration_point_callback = calibration_point_callback
+        self.mask_callback = mask_callback
+        self.bright_spots_callback = bright_spots_callback
+        self.gap_mask_callback = gap_mask_callback
         self.frame: np.ndarray | None = None
         self.display: np.ndarray | None = None
         self.zoom = 1.0
@@ -2949,12 +2966,33 @@ class ImageCanvas(tk.Canvas):
         self._pan_button: int | None = None
         self._pan_dragged = False
         self._pan_threshold_px = 4.0
-        self._beam_center_click_pending = False
         self._pixel_edit_selection: tuple[int, int] | None = None
         self._calibration_points: list[tuple[int, int, int]] = []
         # Viewer-only beam center. This coordinate is never written to HDF5/HDXF.
         # It intentionally lives on the persistent canvas so it survives frame changes.
         self.manual_beam_center: tuple[int, int] | None = None
+        # A persistent, per-view, non-destructive analysis mask shared across
+        # all frames from the same opened detector source. True = excluded.
+        # It never modifies the underlying image or any HDXF/HDF5 data.
+        self.user_mask: np.ndarray | None = None
+        # A separate applied gap mask and a non-scientific, uncommitted preview.
+        # Neither ever modifies source frames. Right-click Clear User Mask leaves
+        # the applied gap mask untouched; Clear Gap Mask does the reverse.
+        self.gap_mask: np.ndarray | None = None
+        self.gap_preview: np.ndarray | None = None
+        self.gap_mask_description = ""
+        # Per-view, per-frame visual bright-spot boxes (not scientific masks).
+        # Run detection off the Tk thread; only Tk main thread draws overlays.
+        self.bright_spots_enabled = False
+        self.bright_spot_options = BrightSpotOptions()
+        self.bright_spot_boxes: list[tuple[int, int, int, int]] = []
+        self._bright_executor: ThreadPoolExecutor | None = None
+        self._bright_future = None
+        self._bright_running_key = None
+        self._bright_request_key = None
+        self._bright_result_key = None
+        self._bright_poll_after: str | None = None
+        self._bright_mask_revision = 0
         # Viewer-only geometry used to render resolution rings.  Values are
         # copied from preserved HDF5/HDXF metadata and are never written back.
         self.resolution_geometry: dict[str, float] | None = None
@@ -3027,12 +3065,7 @@ class ImageCanvas(tk.Canvas):
         return bool(int(getattr(event, "state", 0) or 0) & 0x0001)
 
     def _on_double_left_click(self, event: tk.Event) -> str:
-        """Select one detector pixel for direct live editing.
-
-        Ctrl+double-click remains reserved for the Beam Center gesture.  A
-        normal double-click cancels any pending pan gesture, highlights the
-        selected detector pixel and delegates value editing to the Viewer.
-        """
+        """Select one detector pixel for direct live editing."""
         if self.frame is None or self._event_has_control(event) or self._event_has_shift(event):
             return "break"
         pixel = self._source_pixel_at_screen(event.x, event.y)
@@ -3041,7 +3074,6 @@ class ImageCanvas(tk.Canvas):
         self._pan_start = None
         self._pan_button = None
         self._pan_dragged = False
-        self._beam_center_click_pending = False
         self._pixel_edit_selection = pixel
         self.schedule_render()
         if self.pixel_edit_callback is not None:
@@ -3098,12 +3130,26 @@ class ImageCanvas(tk.Canvas):
 
     def set_frame(self, frame: np.ndarray, display: np.ndarray) -> None:
         old_shape = None if self.frame is None else self.frame.shape
+        frame_changed = frame is not self.frame
         self.frame = frame
         self.display = display
+        if frame_changed:
+            self.bright_spot_boxes = []
+            self._bright_result_key = None
+        # Never carry a same-view mask over to incompatible image geometry.
+        if self.user_mask is not None and self.user_mask.shape != frame.shape:
+            self.user_mask = None
+        if self.gap_mask is not None and self.gap_mask.shape != frame.shape:
+            self.gap_mask = None
+            self.gap_mask_description = ""
+        if self.gap_preview is not None and self.gap_preview.shape != frame.shape:
+            self.gap_preview = None
         if old_shape != frame.shape:
             self.fit_to_window(notify=False)
         else:
             self.schedule_render()
+        if frame_changed:
+            self._request_bright_spots()
 
     def set_display(self, display: np.ndarray) -> None:
         self.display = display
@@ -3230,6 +3276,8 @@ class ImageCanvas(tk.Canvas):
             self.display[sy0:sy1, sx0:sx1],
             sx0, sy0, sx1, sy1,
         )
+        crop = self._apply_gap_mask_shade(crop, sx0, sy0, sx1, sy1)
+        crop = self._apply_user_mask_shade(crop, sx0, sy0, sx1, sy1)
         target_w = max(1, int(round((sx1 - sx0) * self.zoom)))
         target_h = max(1, int(round((sy1 - sy0) * self.zoom)))
         resample = Image.Resampling.NEAREST if self.zoom >= 1 else Image.Resampling.BILINEAR
@@ -3280,12 +3328,338 @@ class ImageCanvas(tk.Canvas):
                         tags=("pixel-value",),
                     )
 
+        self._draw_bright_spot_overlay(left, top, canvas_w, canvas_h)
         self._draw_resolution_ring_overlay()
         self._draw_roi_overlay()
         self._draw_beam_center_overlay()
         self._draw_pixel_edit_selection_overlay()
         self._draw_pointer_overlay()
         self.status_callback(self._current_pointer_info())
+
+    def set_bright_spot_detection(self, enabled: bool, sensitivity: float = 6.0,
+                                  minimum_pixels: int = 2) -> None:
+        """Update visual detection controls without editing a detector frame."""
+        options = BrightSpotOptions(float(sensitivity), int(minimum_pixels))
+        changed = (self.bright_spots_enabled != bool(enabled)
+                   or self.bright_spot_options != options)
+        self.bright_spots_enabled = bool(enabled)
+        self.bright_spot_options = options
+        if changed:
+            self.bright_spot_boxes = []
+            self._bright_result_key = None
+            self._request_bright_spots()
+            self.schedule_render()
+
+    def _request_bright_spots(self) -> None:
+        if not self.bright_spots_enabled or self.frame is None:
+            self._bright_request_key = None
+            return
+        key = (id(self.frame), self._bright_mask_revision, self.bright_spot_options)
+        self._bright_request_key = key
+        if key == self._bright_result_key:
+            return
+        if self._bright_future is None:
+            self._start_bright_spots()
+
+    def _start_bright_spots(self) -> None:
+        key = self._bright_request_key
+        if key is None or self.frame is None or self._bright_future is not None:
+            return
+        if self._bright_executor is None:
+            self._bright_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="HDXF-bright")
+        excluded = self.get_analysis_mask(self.frame.shape)
+        # The frame reference is immutable for this worker; live edits replace it.
+        self._bright_running_key = key
+        self._bright_future = self._bright_executor.submit(
+            detect_bright_spots, self.frame, self.bright_spot_options,
+            excluded_mask=excluded,
+        )
+        if self._bright_poll_after is None:
+            self._bright_poll_after = self.after(75, self._poll_bright_spots)
+
+    def _poll_bright_spots(self) -> None:
+        self._bright_poll_after = None
+        future = self._bright_future
+        if future is None:
+            return
+        if not future.done():
+            self._bright_poll_after = self.after(75, self._poll_bright_spots)
+            return
+        key = self._bright_running_key
+        self._bright_running_key = None
+        self._bright_future = None
+        error = None
+        try:
+            boxes = future.result()
+        except Exception as exc:
+            boxes = []
+            error = f"{type(exc).__name__}: {exc}"
+        if self.bright_spots_enabled and key == self._bright_request_key:
+            self.bright_spot_boxes = boxes
+            self._bright_result_key = key
+            self.schedule_render()
+            if self.bright_spots_callback is not None:
+                self.bright_spots_callback(len(boxes), error)
+        if self._bright_request_key is not None and self._bright_request_key != self._bright_result_key:
+            self._start_bright_spots()
+
+    def _draw_bright_spot_overlay(self, left: float, top: float,
+                                  canvas_w: int, canvas_h: int) -> None:
+        if not self.bright_spots_enabled or not self.bright_spot_boxes:
+            return
+        for x0, y0, x1, y1 in self.bright_spot_boxes:
+            # 1 detector pixel margin; keep tiny regions visible at fit-to-window.
+            a = left + (x0 - 1) * self.zoom
+            b = top + (y0 - 1) * self.zoom
+            c = left + (x1 + 1) * self.zoom
+            d = top + (y1 + 1) * self.zoom
+            if c < 0 or d < 0 or a > canvas_w or b > canvas_h:
+                continue
+            cx, cy = (a+c)/2, (b+d)/2
+            a, c = min(a, cx-2.5), max(c, cx+2.5)
+            b, d = min(b, cy-2.5), max(d, cy+2.5)
+            self.create_rectangle(a, b, c, d, outline="#FF3030", width=1,
+                                  tags=("bright-spot-overlay",))
+
+    def destroy(self) -> None:
+        if self._bright_poll_after is not None:
+            try:
+                self.after_cancel(self._bright_poll_after)
+            except tk.TclError:
+                pass
+            self._bright_poll_after = None
+        if self._bright_executor is not None:
+            self._bright_executor.shutdown(wait=False, cancel_futures=True)
+            self._bright_executor = None
+        super().destroy()
+
+    def get_user_mask(self, shape: tuple[int, int] | None = None) -> np.ndarray | None:
+        """Return a safe snapshot of the per-view user analysis mask."""
+        mask = self.user_mask
+        if mask is None:
+            return None
+        if shape is not None and tuple(shape) != tuple(mask.shape):
+            raise HDXFViewerError(f"User mask shape {mask.shape} != image shape {shape}")
+        return mask.copy()
+
+    def get_gap_mask(self, shape: tuple[int, int] | None = None) -> np.ndarray | None:
+        gap = self.gap_mask
+        if gap is None:
+            return None
+        if shape is not None and tuple(gap.shape) != tuple(shape):
+            raise HDXFViewerError(f"Gap mask shape {gap.shape} != frame shape {shape}")
+        return gap.copy()
+
+    def get_analysis_mask(self, shape: tuple[int, int] | None = None) -> np.ndarray | None:
+        """Committed manual + gap masks; preview is intentionally excluded."""
+        manual = self.get_user_mask(shape)
+        gap = self.get_gap_mask(shape)
+        if manual is None:
+            return gap
+        if gap is None:
+            return manual
+        return np.logical_or(manual, gap)
+
+    def set_gap_preview(self, mask: np.ndarray | None) -> None:
+        if mask is not None:
+            if self.frame is None or tuple(mask.shape) != tuple(self.frame.shape):
+                raise HDXFViewerError("Gap preview must match the active detector frame")
+            mask = np.array(mask, dtype=bool, copy=True)
+            if not np.any(mask):
+                raise HDXFViewerError("Gap preview contains zero pixels")
+        self.gap_preview = mask
+        self.schedule_render()
+
+    def apply_gap_mask(self, mask: np.ndarray, description: str = "") -> bool:
+        if self.frame is None or tuple(mask.shape) != tuple(self.frame.shape):
+            raise HDXFViewerError("Gap mask must match the active detector frame")
+        incoming = np.array(mask, dtype=bool, copy=True)
+        if not np.any(incoming):
+            raise HDXFViewerError("Refusing an empty gap mask")
+        changed = self.gap_mask is None or not np.array_equal(self.gap_mask, incoming)
+        self.gap_mask = incoming
+        self.gap_preview = None
+        self.gap_mask_description = str(description)
+        if changed:
+            self._gap_mask_changed()
+        else:
+            self.schedule_render()
+        return changed
+
+    def clear_gap_mask(self, *, notify: bool = True) -> bool:
+        changed = self.gap_mask is not None
+        self.gap_mask = None
+        self.gap_preview = None
+        self.gap_mask_description = ""
+        if changed:
+            self._bright_mask_revision += 1
+            self.bright_spot_boxes = []
+            self._bright_result_key = None
+            self._request_bright_spots()
+            if notify and self.gap_mask_callback is not None:
+                self.gap_mask_callback(0)
+        self.schedule_render()
+        return changed
+
+    def gap_masked_pixel_count(self) -> int:
+        return 0 if self.gap_mask is None else int(np.count_nonzero(self.gap_mask))
+
+    def _gap_mask_changed(self) -> None:
+        self._bright_mask_revision += 1
+        self.bright_spot_boxes = []
+        self._bright_result_key = None
+        self._request_bright_spots()
+        self.schedule_render()
+        if self.gap_mask_callback is not None:
+            self.gap_mask_callback(self.gap_masked_pixel_count())
+
+    def _apply_gap_mask_shade(self, rgb: np.ndarray, sx0: int, sy0: int,
+                              sx1: int, sy1: int) -> np.ndarray:
+        # Applied gap mask = teal; preview (not used in integration) = amber.
+        for mask, color in ((self.gap_mask, (38, 191, 204)),
+                            (self.gap_preview, (255, 194, 62))):
+            if mask is None:
+                continue
+            selected = mask[sy0:sy1, sx0:sx1]
+            if np.any(selected):
+                values = rgb[selected].astype(np.float32)
+                rgb[selected] = np.clip(values * 0.3 + np.asarray(color) * 0.7,
+                                        0, 255).astype(np.uint8)
+        return rgb
+
+    def _edit_user_mask(self, selection: tuple[int, int] | None = None,
+                        roi: bool = False, *, masked: bool) -> bool:
+        """Set/clear mask bits without ever modifying source pixel values."""
+        if self.frame is None:
+            return False
+        shape = self.frame.shape
+        if self.user_mask is None:
+            if not masked:
+                return False
+            self.user_mask = np.zeros(shape, dtype=bool)
+        mask = self.user_mask
+        assert mask is not None
+        if roi:
+            bbox = self.get_roi()
+            inside = self.roi_mask()
+            if bbox is None or inside is None:
+                return False
+            x, y, width, height = bbox
+            patch = mask[y:y + height, x:x + width]
+            if not np.any(inside):
+                return False
+            changed = bool(np.any(patch[inside] != masked))
+            patch[inside] = masked
+        else:
+            if selection is None:
+                return False
+            x, y = selection
+            if not (0 <= x < shape[1] and 0 <= y < shape[0]):
+                return False
+            changed = bool(mask[y, x] != masked)
+            mask[y, x] = masked
+        if changed:
+            if not np.any(mask):
+                self.user_mask = None
+            self._bright_mask_revision += 1
+            self.bright_spot_boxes = []
+            self._bright_result_key = None
+            self._request_bright_spots()
+            self.schedule_render()
+            if self.mask_callback is not None:
+                self.mask_callback(self.masked_pixel_count())
+        return changed
+
+    def masked_pixel_count(self) -> int:
+        return 0 if self.user_mask is None else int(np.count_nonzero(self.user_mask))
+
+    def clear_user_mask(self, *, notify: bool = True) -> None:
+        changed = self.user_mask is not None
+        self.user_mask = None
+        if changed:
+            self._bright_mask_revision += 1
+            self.bright_spot_boxes = []
+            self._bright_result_key = None
+            self._request_bright_spots()
+            self.schedule_render()
+            if notify and self.mask_callback is not None:
+                self.mask_callback(0)
+
+    def _apply_user_mask_shade(self, rgb: np.ndarray, sx0: int, sy0: int,
+                               sx1: int, sy1: int) -> np.ndarray:
+        if self.user_mask is None:
+            return rgb
+        selected = self.user_mask[sy0:sy1, sx0:sx1]
+        if not np.any(selected):
+            return rgb
+        # Magenta/coral distinguishes excluded pixels from the blue ROI shade.
+        # Source frame values and the main grayscale display stay untouched.
+        original = rgb[selected].astype(np.float32)
+        rgb[selected] = np.clip(original * 0.35 +
+                                np.asarray((250, 72, 126), dtype=np.float32) * 0.65,
+                                0.0, 255.0).astype(np.uint8)
+        return rgb
+
+    def _show_pixel_context_menu(self, event: tk.Event) -> None:
+        """Normal right-click only; ROI drawing continues to own its right clicks."""
+        if self.frame is None or self.roi_draw_mode:
+            return
+        pixel = self._source_pixel_at_screen(event.x, event.y)
+        if pixel is None:
+            return
+        x, y = pixel
+        # High-contrast pixel popup: use fixed white text on deep navy rather
+        # than relying on the operating system's default (often low-contrast)
+        # native menu font and disabled-item palette.
+        menu = tk.Menu(
+            self,
+            tearoff=False,
+            background="#102A49",
+            foreground="#FFFFFF",
+            activebackground="#245582",
+            activeforeground="#FFFFFF",
+            disabledforeground="#D7E5F5",
+            font=("Segoe UI", 11),
+            borderwidth=1,
+            relief="flat",
+            activeborderwidth=0,
+        )
+        menu.add_command(label=f"Pixel X={x}, Y={y}", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Set Beam Center Here",
+                         command=lambda: self.set_manual_beam_center(x, y, notify=True))
+        menu.add_command(label="Clear Beam Center",
+                         state="normal" if self.manual_beam_center is not None else "disabled",
+                         command=lambda: self.clear_manual_beam_center(notify=True))
+        menu.add_separator()
+        already_masked = bool(self.user_mask is not None and self.user_mask[y, x])
+        menu.add_command(label="Mask Pixel", state="disabled" if already_masked else "normal",
+                         command=lambda: self._edit_user_mask((x, y), masked=True))
+        menu.add_command(label="Unmask Pixel", state="normal" if already_masked else "disabled",
+                         command=lambda: self._edit_user_mask((x, y), masked=False))
+        if self.get_roi() is not None:
+            menu.add_separator()
+            menu.add_command(label="Mask Inside ROI",
+                             command=lambda: self._edit_user_mask(roi=True, masked=True))
+            menu.add_command(label="Unmask Inside ROI",
+                             command=lambda: self._edit_user_mask(roi=True, masked=False))
+        menu.add_command(label="Clear All User Masks",
+                         state="normal" if self.user_mask is not None else "disabled",
+                         command=self.clear_user_mask)
+        # Keep the popup alive while Tk processes the user's menu selection.
+        # An after_idle(menu.destroy) here would close it before any click.
+        previous = getattr(self, "_pixel_context_menu", None)
+        if previous is not None:
+            try:
+                previous.destroy()
+            except tk.TclError:
+                pass
+        self._pixel_context_menu = menu
+        try:
+            menu.tk_popup(int(getattr(event, "x_root", self.winfo_pointerx())),
+                          int(getattr(event, "y_root", self.winfo_pointery())))
+        finally:
+            menu.grab_release()
 
     def _draw_pixel_edit_selection_overlay(self) -> None:
         """Highlight the pixel currently selected by a double-left-click."""
@@ -4698,21 +5072,10 @@ class ImageCanvas(tk.Canvas):
                 except Exception:
                     consumed = False
                 if consumed:
-                    self._beam_center_click_pending = False
                     self._pan_start = None
                     self._pan_button = None
                     self._pan_dragged = False
                     return
-
-        # Beam Center is an explicit Ctrl+left-click gesture.  It must not
-        # initiate ROI manipulation or image panning.
-        if button == 1 and self._event_has_control(event):
-            self._beam_center_click_pending = True
-            self._pan_start = None
-            self._pan_button = None
-            self._pan_dragged = False
-            return
-        self._beam_center_click_pending = False
 
         if button == 1 and not self.roi_draw_mode and self.roi is not None:
             resize_mode = self._roi_resize_hit_test(event.x, event.y)
@@ -4751,9 +5114,8 @@ class ImageCanvas(tk.Canvas):
                 self._refresh_hover_cursor()
                 return
 
-        # ROI drawing deliberately reserves only the RIGHT mouse button. The
-        # left mouse button keeps drag-to-pan; Ctrl+left anchors Beam Center
-        # behaviour even while ROI draw mode is armed.
+        # ROI drawing reserves the right mouse button while enabled.
+        # Outside ROI drawing mode, a stationary right click opens the pixel menu.
         if self.roi_draw_mode and button == 3:
             pixel = self._source_pixel_at_screen(event.x, event.y)
             if pixel is None:
@@ -4872,19 +5234,6 @@ class ImageCanvas(tk.Canvas):
         self._notify_view_changed()
 
     def _pan_end(self, event: tk.Event) -> None:
-        if self._beam_center_click_pending:
-            self._beam_center_click_pending = False
-            self._pan_start = None
-            self._pan_button = None
-            self._pan_dragged = False
-            source_x, source_y = self._screen_to_source(event.x, event.y)
-            self.set_manual_beam_center(source_x, source_y, notify=True)
-            self._pointer_inside = True
-            self._pointer_xy = (float(event.x), float(event.y))
-            self._refresh_hover_cursor()
-            self.schedule_render()
-            return
-
         if self._roi_resize_mode is not None:
             self._pointer_inside = True
             self._pointer_xy = (float(event.x), float(event.y))
@@ -4924,7 +5273,7 @@ class ImageCanvas(tk.Canvas):
             return
 
         # Polygon uses repeated right clicks; ButtonRelease must not fall
-        # through to the ordinary right-click beam-centre clear action.
+        # through to the ordinary right-click menu.
         if self.roi_draw_mode and self.roi_draw_shape == "Polygon" and int(getattr(event, "num", 0) or 0) == 3:
             self._pointer_inside = True
             self._pointer_xy = (float(event.x), float(event.y))
@@ -5003,12 +5352,10 @@ class ImageCanvas(tk.Canvas):
         self._refresh_hover_cursor()
 
         if not dragged:
-            # Ordinary left-click is intentionally inert: double-left-click is
-            # reserved for direct pixel editing and Ctrl+left-click sets Beam
-            # Center.  Right-click still clears a Viewer-only Beam Center when
-            # it was not consumed by ROI drawing.
+            # Left click remains inert (double-click edits). Right click opens
+            # a context menu, only when the press wasn't a pan/ROI gesture.
             if button == 3:
-                self.clear_manual_beam_center(notify=True)
+                self._show_pixel_context_menu(event)
         else:
             self._notify_view_changed()
 
@@ -5345,6 +5692,29 @@ class HDXFViewerApp:
         self.tools_frame_var = tk.StringVar(value="Current image  —")
         self.tools_view_var = tk.StringVar(value="No active view")
         self.tools_status_var = tk.StringVar(value="Select a detector view to enable processing tools.")
+        self.bright_spots_enabled_var = tk.BooleanVar(value=False)
+        self.bright_spots_sensitivity_var = tk.StringVar(value="6")
+        self.bright_spots_min_pixels_var = tk.StringVar(value="2")
+        self._bright_valid_sensitivity = 6.0
+        self._bright_valid_minimum = 2
+        self.bright_spots_status_var = tk.StringVar(value="Off · highlights are visual only")
+        # Export images at full detector resolution; the GUI view's zoom/pan
+        # changes only the viewport, not the image file or pixel coordinates.
+        self.image_export_format_var = tk.StringVar(value=PNG_DISPLAY)
+        self.image_export_overlay_var = tk.BooleanVar(value=False)
+        self.image_export_start_var = tk.StringVar(value="1")
+        self.image_export_end_var = tk.StringVar(value="1")
+        self.image_export_step_var = tk.StringVar(value="1")
+        self.image_export_status_var = tk.StringVar(value="Display PNG/JPEG = 8-bit. NPY preserves pixel values.")
+        self.gap_detection_mode_var = tk.StringVar(value="NeXus module metadata")
+        self.gap_rows_var = tk.StringVar(value="")
+        self.gap_columns_var = tk.StringVar(value="")
+        self.gap_padding_var = tk.StringVar(value="0")
+        self.gap_status_var = tk.StringVar(value="Choose a method, then click Preview. Amber=preview, teal=applied.")
+        self._gap_error_message = ""
+        self._gap_error_view_id = None
+        self._gap_error_archive_id = None
+        self._image_export_job: dict[str, Any] | None = None
         # Inline current-frame editor. Values live in the sidebar rather than
         # opening the legacy full-screen processing dialog.
         self.tools_edit_mode_var = tk.StringVar(value="Subtract value")
@@ -5359,7 +5729,7 @@ class HDXFViewerApp:
         self.tools_edit_session_var = tk.StringVar(value="No unsaved edits")
 
         # pyFAI integration page. Geometry is auto-filled from the current
-        # HDF5/HDXF metadata and the Viewer-only Ctrl+click Beam Center, while
+        # HDF5/HDXF metadata and the Viewer-only right-click Beam Center, while
         # remaining editable for calibrated/tilted setups. Integration always
         # uses the current frame, including unsaved temporary pixel edits.
         self.pyfai_view_var = tk.StringVar(value="No active detector view")
@@ -5386,6 +5756,7 @@ class HDXFViewerApp:
         self.pyfai_notebook_fit_var = tk.BooleanVar(value=True)
         self.pyfai_notebook_extra_detector_mask_var = tk.BooleanVar(value=False)
         self.pyfai_unit_var = tk.StringVar(value="q_A^-1")
+        self.pyfai_1d_axis_var = tk.StringVar(value=CORRECTED_THETA)
         self.pyfai_radial_bins_var = tk.StringVar(value="1000")
         # 1D all-frame Y-axis averaging. Each detector frame is integrated
         # independently with identical geometry/radial bins. Frames are processed
@@ -5422,6 +5793,11 @@ class HDXFViewerApp:
         self._pyfai_worker: threading.Thread | None = None
         self._pyfai_queue: queue.Queue[tuple[int, str, Any]] = queue.Queue()
         self._pyfai_run_serial = 0
+        # Every manual mask / detector-mask control change invalidates cached
+        # integration output. Long-running workers record this revision, so a
+        # result computed with an older mask can never replace newer settings.
+        self._pyfai_input_revision = 0
+        self._pyfai_recompute_required = False
         self._pyfai_poll_after_id: str | None = None
 
         # Shared right-sidebar controls edit the ROI of the currently active
@@ -5505,6 +5881,7 @@ class HDXFViewerApp:
         self._processing_stop_requested = False
         self._processing_last_progress = 0.0
         self._processing_output_auto = True
+        self._processing_beam_temp_mask: Path | None = None
 
         self._build_ui()
         self._bind_keys()
@@ -8232,6 +8609,11 @@ class HDXFViewerApp:
         self.processing_operation_var = tk.StringVar(value="mean")
         self.processing_dtype_var = tk.StringVar(value="auto")
         self.processing_keep_azint_var = tk.BooleanVar(value=False)
+        self.processing_i0_path_var = tk.StringVar(value="")
+        self.processing_beam_roi_var = tk.StringVar(value="")
+        self.processing_beam_saturation_var = tk.StringVar(value="")
+        self.processing_beam_mask_var = tk.StringVar(value="")
+        self.processing_use_view_masks_var = tk.BooleanVar(value=True)
 
         # Subtract/Filter controls.
         self.processing_mode_var = tk.StringVar(value="Background subtraction")
@@ -8299,7 +8681,7 @@ class HDXFViewerApp:
             ttk.Label(options, text="OPERATION", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
             op = ttk.Combobox(
                 options, state="readonly", textvariable=self.processing_operation_var,
-                values=("sum", "mean", "exposure-normalized"), style="Modern.TCombobox", width=22,
+                values=("sum", "mean", "exposure-normalized", "i0-normalized", "beam-normalized"), style="Modern.TCombobox", width=22,
             )
             op.grid(row=0, column=1, sticky="ew", padx=(0, 18))
             op.bind("<<ComboboxSelected>>", self._processing_sum_operation_changed)
@@ -8309,6 +8691,25 @@ class HDXFViewerApp:
                 values=("auto", "source", "int16", "int32", "int64", "uint16", "uint32", "uint64", "float32", "float64"),
                 style="Modern.TCombobox", width=14,
             ).grid(row=0, column=3, sticky="ew")
+            normalize = ttk.Frame(options, style="CardAlt.TFrame", padding=(8, 7))
+            normalize.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(9, 0))
+            normalize.grid_columnconfigure(1, weight=1)
+            normalize.grid_columnconfigure(3, weight=1)
+            ttk.Label(normalize, text="I0 DATASET PATH", style="FieldLabel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(normalize, textvariable=self.processing_i0_path_var, style="Modern.TEntry").grid(row=0, column=1, columnspan=3, sticky="ew", pady=3)
+            ttk.Label(normalize, text="BEAM ROI", style="FieldLabel.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(normalize, textvariable=self.processing_beam_roi_var, style="Modern.TEntry").grid(row=1, column=1, sticky="ew", pady=3)
+            ttk.Button(normalize, text="Current ROI", style="Secondary.TButton",
+                       command=self._processing_use_beam_roi).grid(row=1, column=2, sticky="ew", padx=(7, 7), pady=3)
+            ttk.Label(normalize, text="SATURATED AT", style="FieldLabel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(normalize, textvariable=self.processing_beam_saturation_var, style="Modern.TEntry").grid(row=2, column=1, sticky="ew", pady=3)
+            ttk.Label(normalize, text="BEAM MASK (.NPY)", style="FieldLabel.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(normalize, textvariable=self.processing_beam_mask_var, style="Modern.TEntry").grid(row=3, column=1, columnspan=3, sticky="ew", pady=3)
+            ttk.Checkbutton(normalize, text="Also use applied Viewer Manual / Gap Masks when processing the open source",
+                            variable=self.processing_use_view_masks_var,
+                            style="Modern.TCheckbutton").grid(row=4, column=0, columnspan=4, sticky="w", pady=(3, 0))
+            ttk.Label(normalize, text="I0: real monitor Dataset path. Beam: unsaturated ROI x,y,width,height + detector saturation count required; no automatic beam finding.",
+                      style="CardSubtitle.TLabel", wraplength=680, justify="left").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
             if family == "hdf5":
                 ttk.Label(
                     options,
@@ -8557,6 +8958,7 @@ class HDXFViewerApp:
             operation = self.processing_operation_var.get() if self._processing_kind == "sum" else self._processing_kind
             tag = {
                 "sum": "SUM", "mean": "MEAN", "exposure-normalized": "RATE",
+                "i0-normalized": "I0", "beam-normalized": "BEAM",
                 "subtract": "FILTERED", "pixelop": "PIXEL_OP",
             }.get(operation, "PROCESSED")
             selection = "ALL"
@@ -8575,7 +8977,7 @@ class HDXFViewerApp:
             return
         if self._processing_kind == "sum":
             operation = self.processing_operation_var.get() if hasattr(self, "processing_operation_var") else "mean"
-            tag = {"sum": "SUM", "mean": "MEAN", "exposure-normalized": "RATE"}.get(operation, "SUM")
+            tag = {"sum": "SUM", "mean": "MEAN", "exposure-normalized": "RATE", "i0-normalized": "I0", "beam-normalized": "BEAM"}.get(operation, "SUM")
             selection = "ALL"
             selected = self.processing_select_var.get().strip() if hasattr(self, "processing_select_var") else ""
             start = self.processing_frame_from_var.get().strip() if hasattr(self, "processing_frame_from_var") else ""
@@ -8613,6 +9015,96 @@ class HDXFViewerApp:
         exact_entry = getattr(self, "processing_exact_value_entry", None)
         if exact_entry is not None:
             exact_entry.configure(state="normal" if exact_enabled else "disabled")
+
+    def _processing_use_beam_roi(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        canvas = getattr(view, "canvas", None)
+        bbox = canvas.get_roi() if canvas is not None else None
+        if bbox is not None and canvas.get_roi_shape() != "Rectangle":
+            messagebox.showwarning("Beam ROI", "Use a rectangular ROI for direct-beam normalization.", parent=self.root)
+            return
+        if bbox is not None:
+            x, y, width, height = bbox
+            self.processing_beam_roi_var.set(f"{x},{y},{width},{height}")
+        else:
+            messagebox.showinfo("Beam ROI", "Draw a rectangular ROI in the active view first.", parent=self.root)
+
+    def _processing_append_normalization_args(self, cmd: list[str]) -> None:
+        operation = self.processing_operation_var.get()
+        if operation == "i0-normalized":
+            value = self.processing_i0_path_var.get().strip()
+            if not value.startswith("/"):
+                raise HDXFViewerError("I0 normalization needs the actual absolute HDF5 Dataset path")
+            cmd.extend(["--i0-path", value])
+        elif operation == "beam-normalized":
+            roi = self.processing_beam_roi_var.get().strip()
+            if len(roi.split(",")) != 4:
+                raise HDXFViewerError("Beam ROI must be x,y,width,height")
+            try:
+                saturation = float(self.processing_beam_saturation_var.get().strip())
+            except ValueError as exc:
+                raise HDXFViewerError("Beam saturation threshold is required") from exc
+            if not math.isfinite(saturation) or saturation <= 0:
+                raise HDXFViewerError("Beam saturation threshold must be positive and finite")
+            cmd.extend(["--beam-roi", roi, "--beam-saturation", str(saturation)])
+            mask_path = self.processing_beam_mask_var.get().strip()
+            if mask_path:
+                if not Path(mask_path).is_file():
+                    raise HDXFViewerError("Beam mask .npy file does not exist")
+                cmd.extend(["--beam-mask", mask_path])
+
+    def _prepare_processing_viewer_beam_mask(self, cmd: list[str]) -> None:
+        """Pass committed Manual + Gap masks to the beam normalizer, not previews.
+
+        Only reuse masks if the selected input is the very same source shown in
+        the Viewer; a same-shaped image from another experiment is NOT safe.
+        Temporary .npy is deleted at job completion or launch failure.
+        """
+        self._processing_beam_temp_mask = None
+        if (self._processing_kind != "sum" or
+            self.processing_operation_var.get() != "beam-normalized" or
+            not self.processing_use_view_masks_var.get()):
+            return
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            return
+        try:
+            expected = Path(self.processing_input_var.get().strip()).resolve()
+            actual = Path(view.archive.path).resolve()
+        except Exception:
+            return
+        if expected != actual:
+            return
+        applied = view.canvas.get_analysis_mask(view.current_frame.shape)
+        if applied is None or not np.any(applied):
+            return
+        if "--beam-mask" in cmd:
+            index = cmd.index("--beam-mask")
+            existing = np.load(cmd[index + 1], allow_pickle=False)
+            if existing.dtype != np.bool_ or existing.shape != applied.shape:
+                raise HDXFViewerError("Existing beam mask is incompatible with active Viewer masks")
+            applied |= existing
+            del cmd[index:index + 2]
+        fd, temp_path = tempfile.mkstemp(prefix="hdxf_beam_mask_", suffix=".npy")
+        try:
+            os.close(fd)
+            np.save(temp_path, applied, allow_pickle=False)
+        except Exception:
+            Path(temp_path).unlink(missing_ok=True)
+            raise
+        self._processing_beam_temp_mask = Path(temp_path)
+        cmd.extend(["--beam-mask", temp_path])
+
+    def _cleanup_processing_beam_mask(self) -> None:
+        temp_path = getattr(self, "_processing_beam_temp_mask", None)
+        self._processing_beam_temp_mask = None
+        if temp_path is not None:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _processing_use_current_roi(self) -> None:
         view = self.active_view
@@ -8771,6 +9263,7 @@ class HDXFViewerApp:
             self._append_processing_selection(cmd)
             if kind == "sum":
                 cmd.extend(["--out-dtype", self.processing_dtype_var.get()])
+                self._processing_append_normalization_args(cmd)
             elif kind == "subtract":
                 selected_mode = self.processing_mode_var.get()
                 if selected_mode == "Lower threshold":
@@ -8838,6 +9331,7 @@ class HDXFViewerApp:
                 raise HDXFViewerError("input and output HDXF paths must be different")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cmd.extend(["--operation", self.processing_operation_var.get()])
+            self._processing_append_normalization_args(cmd)
             cmd.extend(["--out-dtype", self.processing_dtype_var.get()])
             cmd.extend(["--progress-step", "2"])
             if self.processing_keep_azint_var.get():
@@ -9110,7 +9604,9 @@ class HDXFViewerApp:
             return
         try:
             cmd = self._build_processing_command(validate=True)
+            self._prepare_processing_viewer_beam_mask(cmd)
         except Exception as exc:
+            self._cleanup_processing_beam_mask()
             messagebox.showerror("Cannot start HDXF processing", str(exc), parent=self.root)
             return
 
@@ -9151,6 +9647,7 @@ class HDXFViewerApp:
                 creationflags=creationflags,
             )
         except Exception as exc:
+            self._cleanup_processing_beam_mask()
             messagebox.showerror("HDXF processing launch failed", f"{type(exc).__name__}: {exc}", parent=self.root)
             return
 
@@ -9219,6 +9716,7 @@ class HDXFViewerApp:
                 pass
 
     def _finish_processing_process(self, return_code: int) -> None:
+        self._cleanup_processing_beam_mask()
         self._processing_process = None
         try:
             self.processing_start_button.configure(state="normal")
@@ -9285,6 +9783,7 @@ class HDXFViewerApp:
             except tk.TclError:
                 pass
             self._processing_poll_after_id = None
+        self._cleanup_processing_beam_mask()
         panel = self._processing_panel
         self._processing_panel = None
         self._processing_kind = None
@@ -9671,6 +10170,125 @@ class HDXFViewerApp:
         ttk.Label(frame_strip, text="CURRENT IMAGE", style="FieldLabel.TLabel").pack(side="left")
         ttk.Label(frame_strip, textvariable=self.tools_frame_var, style="ReadoutValue.TLabel").pack(side="right")
 
+        bright = self._make_card(
+            parent,
+            "Bright Spot Detection",
+            "Find pixels much brighter than their local background. Draw thin red boxes; never edit or mask data.",
+        )
+        ttk.Checkbutton(
+            bright, text="Show bright spots (red boxes)",
+            variable=self.bright_spots_enabled_var,
+            command=self._apply_bright_spot_detection,
+            style="Modern.TCheckbutton",
+        ).pack(anchor="w", pady=(0, 8))
+        bright_fields = ttk.Frame(bright, style="Card.TFrame")
+        bright_fields.pack(fill="x", pady=(0, 6))
+        bright_fields.columnconfigure(0, weight=1)
+        bright_fields.columnconfigure(1, weight=1)
+        for column, (heading, variable) in enumerate((
+            ("SENSITIVITY (σ)", self.bright_spots_sensitivity_var),
+            ("MIN SPOT PIXELS", self.bright_spots_min_pixels_var),
+        )):
+            field = ttk.Frame(bright_fields, style="Card.TFrame")
+            field.grid(row=0, column=column, sticky="ew", padx=(0, 5) if column == 0 else (5, 0))
+            ttk.Label(field, text=heading, style="FieldLabel.TLabel").pack(anchor="w")
+            entry = ttk.Entry(field, textvariable=variable, style="Modern.TEntry")
+            entry.pack(fill="x", pady=(3, 0))
+            entry.bind("<Return>", lambda _event: self._apply_bright_spot_detection())
+            entry.bind("<FocusOut>", lambda _event: self._apply_bright_spot_detection())
+        ttk.Label(bright, textvariable=self.bright_spots_status_var,
+                  style="ReadoutMuted.TLabel", wraplength=330,
+                  justify="left").pack(fill="x")
+
+        gap_card = self._make_card(
+            parent, "Detector Module Gap Mask",
+            "Derive gaps from explicit NeXus NXdetector_module data_origin/data_size, "
+            "use conservative image-stripe proposals, or specify 0-based inclusive row/column ranges. "
+            "An image proposal is not proof of physical module geometry.",
+        )
+        ttk.Label(gap_card, text="DETECTION METHOD", style="FieldLabel.TLabel").pack(anchor="w")
+        self.gap_mode_combo = ttk.Combobox(
+            gap_card, state="readonly", textvariable=self.gap_detection_mode_var,
+            values=("NeXus module metadata", "Image stripes (heuristic preview)", "Manual rows / columns"),
+            style="Modern.TCombobox",
+        )
+        self.gap_mode_combo.pack(fill="x", pady=(3, 7))
+        self.gap_mode_combo.bind("<<ComboboxSelected>>", self._gap_mode_changed)
+        ttk.Label(gap_card, textvariable=self.gap_status_var, style="GapFeedback.TLabel",
+                  wraplength=330, justify="left").pack(fill="x", pady=(2, 8))
+        ttk.Label(gap_card, text="ROWS / COLUMNS · 0-BASED, INCLUSIVE (e.g. 500:534)",
+                  style="FieldLabel.TLabel", wraplength=330).pack(anchor="w")
+        gap_fields = ttk.Frame(gap_card, style="Card.TFrame")
+        gap_fields.pack(fill="x", pady=(4, 7))
+        gap_fields.columnconfigure(0, weight=1)
+        gap_fields.columnconfigure(1, weight=1)
+        for col, (label, variable) in enumerate((("GAP ROWS", self.gap_rows_var),
+                                                 ("GAP COLUMNS", self.gap_columns_var))):
+            cell = ttk.Frame(gap_fields, style="Card.TFrame")
+            cell.grid(row=0, column=col, sticky="ew", padx=(0, 4) if col == 0 else (4, 0))
+            ttk.Label(cell, text=label, style="FieldLabel.TLabel").pack(anchor="w")
+            ttk.Entry(cell, textvariable=variable, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+        ttk.Label(gap_card, text="GAP PADDING (0–32 PX)", style="FieldLabel.TLabel").pack(anchor="w")
+        ttk.Entry(gap_card, textvariable=self.gap_padding_var, width=8,
+                  style="Modern.TEntry").pack(anchor="w", pady=(3, 7))
+        self.gap_preview_button = ttk.Button(
+            gap_card, text="Preview Gap Mask", style="Secondary.TButton",
+            command=self._gap_preview_active,
+        )
+        self.gap_preview_button.pack(fill="x", pady=(0, 5))
+        self.gap_apply_button = ttk.Button(
+            gap_card, text="Apply Preview to Integration", style="Accent.TButton",
+            command=self._gap_apply_active,
+        )
+        self.gap_apply_button.pack(fill="x", pady=(0, 5))
+        self.gap_clear_button = ttk.Button(
+            gap_card, text="Clear Gap Mask / Preview", style="Secondary.TButton",
+            command=self._gap_clear_active,
+        )
+        self.gap_clear_button.pack(fill="x")
+
+        image_export = self._make_card(
+            parent,
+            "Export Detector Frames",
+            "Exports the FULL frame at native pixel resolution, using current contrast/invert. "
+            "Display PNG/JPEG are 8-bit; NPY preserves original pixel dtype and any unsaved live edits.",
+        )
+        ttk.Label(image_export, text="OUTPUT FORMAT", style="FieldLabel.TLabel").pack(anchor="w")
+        self.image_export_format_combo = ttk.Combobox(
+            image_export, state="readonly", textvariable=self.image_export_format_var,
+            values=EXPORT_FORMATS, style="Modern.TCombobox",
+        )
+        self.image_export_format_combo.pack(fill="x", pady=(3, 7))
+        self.image_export_format_combo.bind("<<ComboboxSelected>>", self._image_export_format_changed)
+        self.image_export_overlay_check = ttk.Checkbutton(
+            image_export, text="Include Viewer overlays (ROI / Mask / Beam / Rings / Spots)",
+            variable=self.image_export_overlay_var, style="Modern.TCheckbutton",
+        )
+        self.image_export_overlay_check.pack(anchor="w", pady=(0, 7))
+        self.image_export_current_button = ttk.Button(
+            image_export, text="Export Current Frame…", style="Accent.TButton",
+            command=self._export_current_frame,
+        )
+        self.image_export_current_button.pack(fill="x", pady=(0, 7))
+        row = ttk.Frame(image_export, style="Card.TFrame")
+        row.pack(fill="x", pady=(0, 6))
+        for label, variable in (("START", self.image_export_start_var),
+                                ("END", self.image_export_end_var),
+                                ("STEP", self.image_export_step_var)):
+            cell = ttk.Frame(row, style="Card.TFrame")
+            cell.pack(side="left", expand=True, fill="x", padx=(0, 5))
+            ttk.Label(cell, text=label, style="FieldLabel.TLabel").pack(anchor="w")
+            ttk.Entry(cell, textvariable=variable, width=7,
+                      style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+        self.image_export_range_button = ttk.Button(
+            image_export, text="Export Frame Range…", style="Secondary.TButton",
+            command=self._export_frame_range,
+        )
+        self.image_export_range_button.pack(fill="x")
+        ttk.Label(image_export, textvariable=self.image_export_status_var,
+                  style="ReadoutMuted.TLabel", wraplength=330,
+                  justify="left").pack(fill="x", pady=(6, 0))
+
         editor = self._make_card(
             parent,
             "Subtract / Filter · Current Frame",
@@ -9827,6 +10445,175 @@ class HDXFViewerApp:
         ).pack(fill="x", pady=(3, 0))
         self._tools_edit_mode_changed()
 
+    def _gap_mode_changed(self, _event=None) -> None:
+        self._gap_error_message = ""
+        self._gap_error_view_id = None
+        self._gap_error_archive_id = None
+        selected = self.gap_detection_mode_var.get()
+        if selected == "NeXus module metadata":
+            description = "Metadata mode requires at least two NXdetector_module geometries."
+        elif selected == "Image stripes (heuristic preview)":
+            description = "Image mode guesses dark internal stripes: VERIFY positions before Apply."
+        else:
+            description = "Manual mode: enter 0-based inclusive row/column ranges."
+        self.gap_status_var.set(description)
+
+    def _gap_preview_active(self) -> None:
+        # Every click produces visible, persistent feedback. Unexpected parsing
+        # or drawing exceptions must not leave stale previews available to Apply.
+        self.gap_status_var.set("SCANNING: checking detector geometry / current-frame stripe contrast...")
+        self.status_var.set("Module Gap Mask · Preview clicked; scanning...")
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            self.gap_status_var.set("NO PREVIEW: Open a detector frame first.")
+            self.status_var.set("Module Gap Mask · no detector frame open")
+            return
+        try:
+            text = self.gap_padding_var.get().strip()
+            if not text.isdecimal():
+                raise GapMaskError("Padding must be an integer 0..32 pixels")
+            padding = int(text)
+            mode = self.gap_detection_mode_var.get()
+            if mode == "NeXus module metadata":
+                proposal = metadata_module_proposal(view.archive, tuple(view.current_frame.shape), padding)
+            elif mode == "Image stripes (heuristic preview)":
+                proposal = image_stripe_gap_proposal(view.current_frame, padding)
+            elif mode == "Manual rows / columns":
+                proposal = manual_gap_proposal(tuple(view.current_frame.shape),
+                                               self.gap_rows_var.get(), self.gap_columns_var.get(), padding)
+            else:
+                raise GapMaskError("Choose a supported Gap detection method")
+            view.canvas.set_gap_preview(proposal.mask)
+            view.canvas.gap_preview_description = proposal.description
+            self._gap_error_message = ""
+            self._gap_error_view_id = None
+            self._gap_error_archive_id = None
+            if hasattr(self, "gap_apply_button"):
+                self.gap_apply_button.configure(state="normal")
+                self.gap_clear_button.configure(state="normal")
+            count = int(np.count_nonzero(proposal.mask))
+            self.gap_status_var.set(
+                f"PREVIEW READY: {count:,} px (amber). {proposal.description}. "
+                "Only click Apply if the amber bands match true detector gaps."
+            )
+            self.status_var.set(f"Module Gap Mask · preview ready: {count:,} px")
+            # Render before the next Tk input event, so the visual preview is
+            # not mistaken for an inactive button on slower Windows systems.
+            view.canvas.schedule_render()
+        except Exception as exc:
+            view.canvas.set_gap_preview(None)
+            if hasattr(self, "gap_apply_button"):
+                self.gap_apply_button.configure(state="disabled")
+            explanation = str(exc) or type(exc).__name__
+            if self.gap_detection_mode_var.get() == "NeXus module metadata" and "No complete" in explanation:
+                explanation += " Use Image stripes (heuristic preview), or Manual rows / columns."
+            if not isinstance(exc, (GapMaskError, HDXFViewerError, ValueError)):
+                # Unexpected failures need explicit diagnostics, not silent Tk
+                # callback exceptions that are only visible in the console.
+                explanation = f"Unexpected {type(exc).__name__}: {explanation}"
+                traceback.print_exc()
+            self._gap_error_message = f"NO PREVIEW: {explanation}"
+            self._gap_error_view_id = id(view)
+            self._gap_error_archive_id = id(view.archive)
+            self.gap_status_var.set(self._gap_error_message)
+            self.status_var.set(f"Module Gap Mask · {self._gap_error_message}")
+            # A real warning dialog is intentional here: when the status card
+            # is scrolled away or refreshed, users must still see why the
+            # Preview button did not paint anything on the image.
+            try:
+                messagebox.showwarning("Module Gap Mask — no preview", explanation, parent=self.root)
+            except tk.TclError:
+                pass
+
+    def _gap_apply_active(self) -> None:
+        view = self.active_view
+        if view is None or view.archive is None or view.canvas.gap_preview is None:
+            self.gap_status_var.set("Nothing to apply; create a Gap Mask preview first.")
+            return
+        count = int(np.count_nonzero(view.canvas.gap_preview))
+        self._gap_error_message = ""
+        self._gap_error_view_id = None
+        self._gap_error_archive_id = None
+        view.canvas.apply_gap_mask(view.canvas.gap_preview,
+                                   getattr(view.canvas, "gap_preview_description", "Gap mask"))
+        if hasattr(self, "gap_apply_button"):
+            self.gap_apply_button.configure(state="disabled")
+        self.gap_status_var.set(
+            f"APPLIED: {count:,} gap pixels (teal), excluding them from pyFAI / Notebook. "
+            f"Manual mask: {view.canvas.masked_pixel_count():,} px remains separate."
+        )
+
+    def _gap_clear_active(self) -> None:
+        view = self.active_view
+        if view is None:
+            return
+        view.canvas.clear_gap_mask()
+        self._gap_error_message = ""
+        self._gap_error_view_id = None
+        self._gap_error_archive_id = None
+        if hasattr(self, "gap_apply_button"):
+            self.gap_apply_button.configure(state="disabled")
+            self.gap_clear_button.configure(state="disabled")
+        self.gap_status_var.set(
+            f"Gap Mask cleared; {view.canvas.masked_pixel_count():,} manual masked pixels preserved."
+        )
+
+    def _refresh_gap_status(self) -> None:
+        view = self.active_view
+        if (self._gap_error_message and view is not None and view.archive is not None
+                and self._gap_error_view_id == id(view)
+                and self._gap_error_archive_id == id(view.archive)):
+            self.gap_status_var.set(self._gap_error_message)
+        elif view is None or view.archive is None:
+            self._gap_error_message = ""
+            self.gap_status_var.set("Open a detector source to preview Module Gaps.")
+        elif view.canvas.gap_preview is not None:
+            self.gap_status_var.set(
+                f"PREVIEW ONLY: {np.count_nonzero(view.canvas.gap_preview):,} pixels "
+                "(amber). Not used by integration until Apply."
+            )
+        elif view.canvas.gap_mask is not None:
+            self.gap_status_var.set(
+                f"APPLIED: {view.canvas.gap_masked_pixel_count():,} gap pixels (teal). "
+                f"Manual: {view.canvas.masked_pixel_count():,} px (pink)."
+            )
+        else:
+            self.gap_status_var.set("No applied Gap Mask. Preview first; zero-valued pixels are not inferred.")
+
+    def _apply_bright_spot_detection(self) -> None:
+        """Apply shared visual detection parameters to all open view canvases."""
+        enabled = bool(self.bright_spots_enabled_var.get())
+        sensitivity = self._bright_valid_sensitivity
+        minimum = self._bright_valid_minimum
+        if enabled:
+            try:
+                sensitivity = float(self.bright_spots_sensitivity_var.get().strip())
+                minimum = int(self.bright_spots_min_pixels_var.get().strip())
+                if not (math.isfinite(sensitivity) and 1 <= sensitivity <= 50):
+                    raise ValueError("Sensitivity must be in the range 1–50")
+                if not (1 <= minimum <= 1000000):
+                    raise ValueError("Minimum spot pixels must be a positive integer")
+            except ValueError as exc:
+                self.bright_spots_status_var.set(f"Invalid parameters: {exc}")
+                return
+            self._bright_valid_sensitivity = sensitivity
+            self._bright_valid_minimum = minimum
+        for view in self.views:
+            view.canvas.set_bright_spot_detection(enabled, sensitivity, minimum)
+        self._refresh_bright_spot_status()
+
+    def _refresh_bright_spot_status(self) -> None:
+        view = self.active_view
+        if not self.bright_spots_enabled_var.get():
+            self.bright_spots_status_var.set("Off · highlights are visual only")
+        elif view is None or view.current_frame is None:
+            self.bright_spots_status_var.set("Open a frame to detect bright spots")
+        elif view.canvas._bright_result_key is None:
+            self.bright_spots_status_var.set("Detecting current frame…")
+        else:
+            n = len(view.canvas.bright_spot_boxes)
+            self.bright_spots_status_var.set(f"{n} bright region(s) · display only, no masking")
+
     def _build_pyfai_sidebar(self, parent: ttk.Frame) -> None:
         """Build current-frame pyFAI 1D radial integration and 2D caking UI."""
         header = ttk.Frame(parent, style="Side.TFrame")
@@ -9852,7 +10639,7 @@ class HDXFViewerApp:
         geometry = self._make_card(
             parent,
             "Geometry",
-            "Auto-filled from HDF5/HDXF. Ctrl+left-click the image to override Beam Center. Values remain editable.",
+            "Auto-filled from HDF5/HDXF. Right-click a pixel to set/clear Beam Center or mask pixels.",
         )
         ttk.Label(geometry, textvariable=self.pyfai_geometry_source_var, style="ReadoutMuted.TLabel", wraplength=330, justify="left").pack(fill="x", pady=(0, 7))
 
@@ -9872,7 +10659,8 @@ class HDXFViewerApp:
 
         pair_row("DISTANCE (M)", self.pyfai_distance_var, "WAVELENGTH (Å)", self.pyfai_wavelength_var)
         pair_row("PIXEL X (M)", self.pyfai_pixel_x_var, "PIXEL Y (M)", self.pyfai_pixel_y_var)
-        pair_row("BEAM X (PX)", self.pyfai_beam_x_var, "BEAM Y (PX)", self.pyfai_beam_y_var)
+        pair_row("PONI X (PX)", self.pyfai_beam_x_var, "PONI Y (PX)", self.pyfai_beam_y_var)
+        ttk.Label(geometry, text="With tilt, PONI is NOT necessarily the direct-beam pixel. Right-click beam center initializes PONI only for zero tilt.", style="ReadoutMuted.TLabel", wraplength=330, justify="left").pack(fill="x", pady=(0, 6))
 
         rotations = ttk.Frame(geometry, style="Card.TFrame")
         rotations.pack(fill="x", pady=(0, 7))
@@ -9907,6 +10695,8 @@ class HDXFViewerApp:
             style="Secondary.TButton",
             command=self._save_pyfai_poni,
         ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(geometry, text="Geometry Preview (2θ / Δ2θ)…", style="Secondary.TButton",
+                   command=self._pyfai_geometry_preview).pack(fill="x", pady=(7, 0))
         ttk.Label(
             geometry,
             textvariable=self.pyfai_poni_file_var,
@@ -10007,9 +10797,17 @@ class HDXFViewerApp:
         self.pyfai_unit_combo.pack(fill="x", pady=(3, 0))
         ttk.Label(u2, text="RADIAL BINS", style="FieldLabel.TLabel").pack(anchor="w")
         ttk.Entry(u2, textvariable=self.pyfai_radial_bins_var, style="Modern.TEntry").pack(fill="x", pady=(3, 0))
+        ttk.Label(integration, text="1D RADIAL AXIS", style="FieldLabel.TLabel").pack(anchor="w")
+        self.pyfai_1d_axis_box = ttk.Frame(integration, style="Card.TFrame")
+        self.pyfai_1d_axis_box.pack(fill="x", pady=(3, 7))
+        self.pyfai_1d_axis_combo = ttk.Combobox(
+            self.pyfai_1d_axis_box, state="readonly", textvariable=self.pyfai_1d_axis_var,
+            values=ONE_D_AXES, style="Modern.TCombobox",
+        )
+        self.pyfai_1d_axis_combo.pack(fill="x")
         ttk.Label(
             integration,
-            text="Notebook 1D: 2θ = atan(radius_px × pixel_mm / distance_mm), degrees. Legacy pyFAI 1D: θ in radians.",
+            text="Standard 1D uses pyFAI 2θ/q geometry, including tilt. Legacy radius θ is available only at zero tilt. Notebook Reference keeps its separate perpendicular-detector model.",
             style="ReadoutMuted.TLabel",
             wraplength=330,
             justify="left",
@@ -10073,8 +10871,10 @@ class HDXFViewerApp:
         ttk.Checkbutton(self.pyfai_notebook_box, text="Notebook Gaussian beam-center fit",
                         variable=self.pyfai_notebook_fit_var,
                         style="Modern.TCheckbutton").pack(anchor="w", pady=(0, 5))
-        ttk.Checkbutton(self.pyfai_notebook_box, text="Also apply HDXF detector mask (NOT notebook exact)",
+        ttk.Checkbutton(self.pyfai_notebook_box,
+                        text="Also apply source HDF5/HDXF pixel_mask (NOT notebook exact)",
                         variable=self.pyfai_notebook_extra_detector_mask_var,
+                        command=self._pyfai_invalidate_mask_result,
                         style="Modern.TCheckbutton").pack(anchor="w", pady=(0, 5))
         ttk.Button(self.pyfai_notebook_box, text="Apply Notebook geometry (65 mm / 0.075 mm)",
                    style="Secondary.TButton", command=self._notebook_apply_geometry).pack(fill="x", pady=(0, 5))
@@ -10101,8 +10901,13 @@ class HDXFViewerApp:
 
         corr = ttk.Frame(integration, style="Card.TFrame")
         corr.pack(fill="x", pady=(0, 7))
-        ttk.Checkbutton(corr, text="Detector mask", variable=self.pyfai_use_detector_mask_var, style="Modern.TCheckbutton").pack(anchor="w")
-        ttk.Checkbutton(corr, text="Only current ROI", variable=self.pyfai_use_roi_var, style="Modern.TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(corr, text="Source HDF5/HDXF pixel_mask (Manual + Gap masks always apply)",
+                        variable=self.pyfai_use_detector_mask_var,
+                        command=self._pyfai_invalidate_mask_result,
+                        style="Modern.TCheckbutton").pack(anchor="w")
+        ttk.Checkbutton(corr, text="Only current ROI", variable=self.pyfai_use_roi_var,
+                        command=self._pyfai_invalidate_mask_result,
+                        style="Modern.TCheckbutton").pack(anchor="w")
         ttk.Checkbutton(corr, text="Solid-angle correction", variable=self.pyfai_solid_angle_var, style="Modern.TCheckbutton").pack(anchor="w")
         pol = ttk.Frame(integration, style="Card.TFrame")
         pol.pack(fill="x", pady=(0, 7))
@@ -10123,15 +10928,44 @@ class HDXFViewerApp:
         result_row.pack(fill="x")
         self.pyfai_show_result_button = ttk.Button(result_row, text="Show Result", style="Secondary.TButton", command=self._show_pyfai_result_window)
         self.pyfai_show_result_button.pack(side="left", fill="x", expand=True)
-        self.pyfai_export_button = ttk.Button(result_row, text="Export…", style="Secondary.TButton", command=self._export_pyfai_result)
+        self.pyfai_export_button = ttk.Button(result_row, text="Export Data…", style="Secondary.TButton", command=self._export_pyfai_result)
         self.pyfai_export_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.pyfai_export_chart_button = ttk.Button(
+            result, text="Save Chart…  (PNG / JPG / SVG / PDF)",
+            style="Secondary.TButton", command=self._export_pyfai_chart,
+        )
+        self.pyfai_export_chart_button.pack(fill="x", pady=(6, 0))
         self._pyfai_mode_changed()
+        # An edited geometry must never leave an obsolete integral exportable.
+        # Use trace_add because numeric entries need not lose focus to change.
+        tracked = (
+            self.pyfai_distance_var, self.pyfai_pixel_x_var, self.pyfai_pixel_y_var,
+            self.pyfai_wavelength_var, self.pyfai_beam_x_var, self.pyfai_beam_y_var,
+            self.pyfai_rot1_var, self.pyfai_rot2_var, self.pyfai_rot3_var,
+            self.pyfai_1d_axis_var, self.pyfai_mode_var,
+            self.pyfai_radial_bins_var, self.pyfai_unit_var,
+            self.pyfai_azimuth_min_var, self.pyfai_azimuth_max_var,
+            self.pyfai_azimuth_bins_var, self.pyfai_polarization_var,
+            self.pyfai_solid_angle_var,
+        )
+        self._pyfai_geometry_trace_refs = [
+            (var, var.trace_add("write", self._pyfai_geometry_setting_changed))
+            for var in tracked
+        ]
+
+    def _pyfai_geometry_setting_changed(self, *_args: Any) -> None:
+        if self._pyfai_result is not None or (self._pyfai_worker is not None and self._pyfai_worker.is_alive()):
+            self._pyfai_invalidate_mask_result(reason="Geometry / integration settings")
+        # Invalidate integrator cache after changing geometry parameters.
+        self._pyfai_ai_cache.clear()
 
     def _pyfai_reload_view_geometry(self) -> None:
         """Drop any PONI/refinement override and reload geometry from active data."""
         self._pyfai_loaded_detector = None
         self._pyfai_geometry_override_source = None
         self.pyfai_poni_file_var.set("No PONI file loaded")
+        for angle in (self.pyfai_rot1_var, self.pyfai_rot2_var, self.pyfai_rot3_var):
+            angle.set("0")
         self._pyfai_ai_cache.clear()
         self._refresh_pyfai_sidebar(force_geometry=True)
 
@@ -10183,6 +11017,72 @@ class HDXFViewerApp:
                 tuple(view.canvas.manual_beam_center) if view.canvas.manual_beam_center is not None else None,
             )
         self._pyfai_ai_cache.clear()
+
+    def _pyfai_geometry_preview(self) -> None:
+        """Display actual pyFAI 2θ and tilt shift, never resample detector data."""
+        if not PYFAI_AVAILABLE or PyFAIAzimuthalIntegrator is None:
+            messagebox.showerror("Geometry Preview", "pyFAI is not installed.", parent=self.root)
+            return
+        view = self.active_view
+        if view is None or view.current_frame is None:
+            messagebox.showinfo("Geometry Preview", "Open a detector frame first.", parent=self.root)
+            return
+        try:
+            config = self._pyfai_config_from_ui(view)
+            shape = tuple(config["shape"])
+            if shape[0] * shape[1] > 8_000_000:
+                raise HDXFViewerError("Preview limited to 8 million pixels to protect UI memory.")
+            ai = self._pyfai_integrator_for_config(config)
+            current = two_theta_degrees(ai, shape)
+            reference = PyFAIAzimuthalIntegrator(
+                dist=float(config["distance_m"]), poni1=float(config["poni1"]),
+                poni2=float(config["poni2"]), rot1=0., rot2=0., rot3=0.,
+                detector=self._pyfai_detector_for_config(config),
+                wavelength=float(config["wavelength_m"]),
+            )
+            delta = current - two_theta_degrees(reference, shape)
+            # Resample geometry maps for display only, NOT frame data.
+            max_w, max_h = 720, 430
+            step = max(1, int(math.ceil(max(shape[1] / max_w, shape[0] / max_h))))
+            modes = {"2θ map (degrees)": (current[::step, ::step], False),
+                     "Δ2θ vs zero rotation (degrees)": (delta[::step, ::step], True)}
+            preview = tk.Toplevel(self.root)
+            preview.title("pyFAI Detector Geometry Preview")
+            preview.configure(background=UI_BG)
+            preview.geometry("780x580")
+            controls = ttk.Frame(preview, style="Topbar.TFrame", padding=(12, 9))
+            controls.pack(fill="x")
+            mode_var = tk.StringVar(master=preview, value="Δ2θ vs zero rotation (degrees)")
+            combo = ttk.Combobox(controls, textvariable=mode_var, values=tuple(modes),
+                                 state="readonly", width=36, style="Modern.TCombobox")
+            combo.pack(side="left")
+            details = tk.StringVar(master=preview)
+            canvas = tk.Canvas(preview, background=UI_CANVAS, highlightthickness=0)
+            canvas.pack(fill="both", expand=True, padx=12)
+            ttk.Label(preview, textvariable=details, style="ReadoutMuted.TLabel",
+                      wraplength=745, justify="left").pack(fill="x", padx=16, pady=(6, 12))
+            photos = {}
+            def redraw(*_args: Any) -> None:
+                image_map, is_delta = modes[mode_var.get()]
+                rgb, lo, hi = color_geometry_map(image_map, delta=is_delta)
+                photo = ImageTk.PhotoImage(Image.fromarray(rgb, mode="RGB"))
+                photos["current"] = photo
+                canvas.delete("all")
+                canvas.create_image(max(0, (canvas.winfo_width() - rgb.shape[1]) // 2),
+                                    max(0, (canvas.winfo_height() - rgb.shape[0]) // 2),
+                                    anchor="nw", image=photo)
+                details.set(
+                    f"Range: {lo:.6g} to {hi:.6g} degrees | "
+                    f"ROT1/2/3 = {math.degrees(config['rot1']):.4g} / "
+                    f"{math.degrees(config['rot2']):.4g} / {math.degrees(config['rot3']):.4g} degrees. "
+                    "Preview depicts pyFAI coordinate maps, not the diffraction frame. "
+                    "Notebook Reference is not geometry corrected."
+                )
+            combo.bind("<<ComboboxSelected>>", redraw)
+            canvas.bind("<Configure>", redraw)
+            preview.after_idle(redraw)
+        except Exception as exc:
+            messagebox.showerror("Geometry Preview", f"Could not calculate geometry: {type(exc).__name__}: {exc}", parent=self.root)
 
     def _load_pyfai_poni(self) -> None:
         if not PYFAI_AVAILABLE or pyFAI is None:
@@ -10408,6 +11308,7 @@ class HDXFViewerApp:
         is_2d = mode_label.startswith("2D")
         is_notebook = mode_label.startswith("1D Notebook")
         self.pyfai_2d_box.pack_forget()
+        self.pyfai_1d_axis_box.pack_forget()
         self.pyfai_1d_average_box.pack_forget()
         self.pyfai_notebook_box.pack_forget()
         if is_2d:
@@ -10415,6 +11316,7 @@ class HDXFViewerApp:
         elif is_notebook:
             self.pyfai_notebook_box.pack(fill="x", pady=(0, 7), before=self.pyfai_run_button)
         else:
+            self.pyfai_1d_axis_box.pack(fill="x", pady=(0, 7), before=self.pyfai_run_button)
             self.pyfai_1d_average_box.pack(fill="x", pady=(0, 7), before=self.pyfai_run_button)
         if hasattr(self, "pyfai_unit_combo"):
             self.pyfai_unit_combo.configure(state="readonly" if is_2d else "disabled")
@@ -10497,7 +11399,7 @@ class HDXFViewerApp:
     def _pyfai_beam_center_for_view(self, view: InternalViewState) -> tuple[float | None, float | None, str]:
         if view.canvas.manual_beam_center is not None:
             x, y = view.canvas.manual_beam_center
-            return float(x), float(y), "Viewer Beam Center (Ctrl+left-click)"
+            return float(x), float(y), "Viewer Beam Center (right-click menu)"
         archive = view.archive
         if archive is None:
             return None, None, "Beam Center missing"
@@ -10516,7 +11418,7 @@ class HDXFViewerApp:
                 return float(x), float(y), "HDF5/HDXF Beam Center metadata"
         except Exception:
             pass
-        return None, None, "Beam Center missing — Ctrl+left-click image"
+        return None, None, "Beam Center missing — right-click image"
 
     def _refresh_pyfai_sidebar(self, *, force_geometry: bool = False) -> None:
         if not hasattr(self, "pyfai_run_button"):
@@ -10536,6 +11438,7 @@ class HDXFViewerApp:
             self.pyfai_run_button.configure(state="disabled")
             self.pyfai_show_result_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
             self.pyfai_export_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+            self.pyfai_export_chart_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
             return
         self.pyfai_view_var.set(f"VIEW {view.view_id:02d} · {getattr(view.archive, 'file_format', 'DATA')}")
         self.pyfai_file_var.set(view.archive.path.name)
@@ -10546,6 +11449,7 @@ class HDXFViewerApp:
         self.pyfai_run_button.configure(state="normal" if (PYFAI_AVAILABLE or self.pyfai_mode_var.get().startswith("1D Notebook")) else "disabled")
         self.pyfai_show_result_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
         self.pyfai_export_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
+        self.pyfai_export_chart_button.configure(state="normal" if self._pyfai_result is not None else "disabled")
 
         context = (
             id(view),
@@ -10554,6 +11458,10 @@ class HDXFViewerApp:
             tuple(view.canvas.manual_beam_center) if view.canvas.manual_beam_center is not None else None,
         )
         previous_context = self._pyfai_geometry_context
+        if previous_context is not None and previous_context[:2] != context[:2]:
+            # Never silently reuse a different file's detector tilt.
+            for angle in (self.pyfai_rot1_var, self.pyfai_rot2_var, self.pyfai_rot3_var):
+                angle.set("0")
         if (
             self._pyfai_geometry_override_source is not None
             and previous_context is not None
@@ -10610,7 +11518,7 @@ class HDXFViewerApp:
             # Keep the progress text emitted by the running worker when possible.
             if not self.pyfai_status_var.get().startswith("Averaging pyFAI 1D"):
                 self.pyfai_status_var.set("Integrating current frame…")
-        elif self._pyfai_result is None:
+        elif self._pyfai_result is None and not self._pyfai_recompute_required:
             self.pyfai_status_var.set("Ready · verify geometry, then run 1D or 2D integration.")
 
     @staticmethod
@@ -10670,10 +11578,48 @@ class HDXFViewerApp:
                 raise HDXFViewerError(f"Detector mask shape {array.shape} does not match frame {shape}")
         return np.asarray(array != 0, dtype=bool)
 
+    def _pyfai_invalidate_mask_result(self, reason: str = "Mask settings") -> None:
+        """Discard plotted results computed before a user/source mask change.
+
+        Masking changes data selection, not just how an image is drawn. Leaving
+        the previous pyFAI curve exportable was misleading. The GUI does not
+        automatically redo expensive all-frame integration: users explicitly
+        press Run, and completed obsolete worker results are rejected below.
+        """
+        self._pyfai_input_revision += 1
+        self._pyfai_recompute_required = True
+        self._pyfai_result = None
+        window = self._pyfai_result_window
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+        self._pyfai_result_window = None
+        self._pyfai_result_canvas = None
+        self._pyfai_result_photo = None
+        for name in ("pyfai_show_result_button", "pyfai_export_button", "pyfai_export_chart_button"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state="disabled")
+        if self._pyfai_worker is not None and self._pyfai_worker.is_alive():
+            self.pyfai_status_var.set(
+                f"{reason} changed during integration. Old result will be discarded; run again when finished."
+            )
+        else:
+            self.pyfai_status_var.set(
+                f"{reason} changed. Previous plot cleared. Press Run to recalculate."
+            )
+
     def _pyfai_combined_mask(self, view: InternalViewState, frame: np.ndarray) -> np.ndarray | None:
         shape = tuple(int(v) for v in frame.shape)
         mask = np.zeros(shape, dtype=bool)
         used = False
+        user_mask = view.canvas.get_analysis_mask(shape)
+        if user_mask is not None:
+            mask |= user_mask
+            used = True
         if self.pyfai_use_detector_mask_var.get():
             detector_mask = self._pyfai_detector_mask_for_view(view, shape)
             if detector_mask is not None:
@@ -10735,10 +11681,11 @@ class HDXFViewerApp:
             if not -1.0 <= polarization <= 1.0:
                 raise HDXFViewerError("Polarization must be within -1..1")
         unit = self.pyfai_unit_var.get().strip() or "q_A^-1"
-        # 1D is integrated in detector radius (mm), then converted to the
-        # requested Bragg-angle axis theta = 0.5*atan(R/L), with R and L in
-        # the same physical length unit. 2D keeps the selected pyFAI unit.
-        integration_unit = "r_mm" if mode == "1d" else unit
+        # pyFAI native angular/q units correctly include dist/PONI/rotations.
+        # Keep the historical radial-radius conversion only as an explicit
+        # zero-tilt compatibility option.
+        axis_spec = get_1d_axis_spec(self.pyfai_1d_axis_var.get(), rot1, rot2, rot3) if mode == "1d" else None
+        integration_unit = axis_spec.integration_unit if axis_spec is not None else unit
         # Viewer Beam Center is stored as a 0-based pixel index. pyFAI's PONI
         # coordinate references pixel edges, so the selected pixel centre is +0.5.
         poni1 = (beam_y + 0.5) * pixel_y
@@ -10762,7 +11709,7 @@ class HDXFViewerApp:
             "azimuth_range": (chi_min, chi_max),
             "unit": unit,
             "integration_unit": integration_unit,
-            "one_d_axis": "theta_custom_rad",
+            "one_d_axis": axis_spec.display_axis if axis_spec is not None else None,
             "correct_solid_angle": bool(self.pyfai_solid_angle_var.get()),
             "polarization_factor": polarization,
             "shape": tuple(int(v) for v in frame.shape),
@@ -10882,6 +11829,10 @@ class HDXFViewerApp:
         """Capture detector/ROI mask once on the UI thread for a 1D frame group."""
         mask = np.zeros(shape, dtype=bool)
         used = False
+        user_mask = view.canvas.get_analysis_mask(shape)
+        if user_mask is not None:
+            mask |= user_mask
+            used = True
         if self.pyfai_use_detector_mask_var.get():
             detector_mask = self._pyfai_detector_mask_for_view(view, shape)
             if detector_mask is not None:
@@ -10938,7 +11889,16 @@ class HDXFViewerApp:
             shape = tuple(original.shape)
             use_detector_mask = bool(self.pyfai_notebook_extra_detector_mask_var.get())
             # For literal Notebook parity, the separate extra mask defaults off.
-            additional_mask = self._pyfai_detector_mask_for_view(view, shape) if use_detector_mask else None
+            detector_mask = self._pyfai_detector_mask_for_view(view, shape) if use_detector_mask else None
+            gap_mask = view.canvas.get_gap_mask(shape)
+            additional_mask = detector_mask
+            if gap_mask is not None:
+                additional_mask = gap_mask if additional_mask is None else (additional_mask | gap_mask)
+            # The manual mask is explicit user intent, independent of the optional
+            # source detector-mask toggle. Snapshot before background integration.
+            user_mask = view.canvas.get_user_mask(shape)
+            if user_mask is not None:
+                additional_mask = user_mask if additional_mask is None else (additional_mask | user_mask)
             edited_paths = {int(i): Path(path) for i, path in view.edited_frame_files.items()}
             archive_path = Path(view.archive.path)
             archive_kind = "hdf5" if isinstance(view.archive, HDF5Archive) else "hdxf"
@@ -10950,13 +11910,23 @@ class HDXFViewerApp:
                 "bin_width_px": bin_width, "exclude_radius_px": min_radius,
                 "gap_positions": gaps, "fit_beam": fit_beam, "source_mode": source_mode,
                 "detector_mask_optional": use_detector_mask,
+                "user_mask_pixels": view.canvas.masked_pixel_count(),
+                "gap_mask_pixels": view.canvas.gap_masked_pixel_count(),
+                "source_mask_pixels": 0 if detector_mask is None else int(np.count_nonzero(detector_mask)),
+                "extra_mask_pixels": 0 if additional_mask is None else int(np.count_nonzero(additional_mask)),
             }
         except Exception as exc:
             messagebox.showerror("Notebook reference parameters", str(exc), parent=self.root)
             return
         serial = self._pyfai_run_serial = self._pyfai_run_serial + 1
+        analysis_revision = self._pyfai_input_revision
+        self._pyfai_recompute_required = False
         self.pyfai_run_button.configure(state="disabled")
-        self.pyfai_status_var.set(f"Notebook reference · {source_mode} · preparing image...")
+        self.pyfai_status_var.set(
+            f"Notebook reference · {source_mode} · extra mask "
+            f"{config['extra_mask_pixels']:,} px (manual {config['user_mask_pixels']:,}, "
+            f"gap {config['gap_mask_pixels']:,}, source {config['source_mask_pixels']:,}) · preparing image..."
+        )
 
         def worker() -> None:
             reader = None
@@ -10993,9 +11963,35 @@ class HDXFViewerApp:
                         raise HDXFViewerError("No frames to average")
                 if image.shape != shape:
                     raise HDXFViewerError(f"Reference NPY shape {image.shape} != active frame {shape}")
+                self._pyfai_queue.put((serial, "stage", "Notebook: reducing averaged image with selected masks..."))
                 calculation = calculate_notebook_reference(image, options, extra_mask=additional_mask)
+                comparison = None
+                # Reduce the SAME averaged image twice. Keep the source mask in
+                # both runs; only the manual mask differs. Reuse the beam fit so
+                # changing the mask cannot silently shift the x-axis geometry.
+                if user_mask is not None and np.any(user_mask):
+                    base_with_user = calculation["base_mask"]
+                    baseline_options = replace(
+                        options, fit_beam=False,
+                        beam_x=float(calculation["beam_x"]),
+                        beam_y=float(calculation["beam_y"]),
+                    )
+                    self._pyfai_queue.put((serial, "stage", "Notebook: computing no-manual-mask reference and Δ curves..."))
+                    baseline = calculate_notebook_reference(
+                        image, baseline_options, extra_mask=(gap_mask if detector_mask is None else
+                                                           detector_mask if gap_mask is None else (detector_mask | gap_mask)),
+                    )
+                    comparison = make_mask_comparison(
+                        baseline, calculation, excluded_radius=min_radius,
+                    )
+                    comparison["newly_excluded_pixels"] = int(np.count_nonzero(
+                        base_with_user & ~baseline["base_mask"]
+                    ))
+                    comparison["manual_pixels"] = int(np.count_nonzero(user_mask))
+                    for key in ("base_mask", "hot_mask", "sigma_mask"):
+                        baseline.pop(key, None)
                 # Do not move full-size masks across the GUI queue. They are
-                # not needed for the 1D plot or CSV export.
+                # not needed for the 1D plot, comparison or CSV export.
                 for key in ("base_mask", "hot_mask", "sigma_mask"):
                     calculation.pop(key, None)
                 source = {
@@ -11005,12 +12001,14 @@ class HDXFViewerApp:
                     "frame_count_averaged": averaged, "calculation_block_size": 0,
                     "calculation_block_count": 1, "edited_frames_in_average": len(edited_paths),
                     "average_scope": source_mode,
+                    "analysis_revision": analysis_revision,
                 }
                 powder = calculation["sigma_clipped"]
                 payload = {
                     "kind": "notebook_1d", "profiles": calculation,
                     "radial": powder["two_theta_deg"], "intensity": powder["intensity"],
                     "config": config, "source": source,
+                    "mask_comparison": comparison,
                 }
                 self._pyfai_queue.put((serial, "done", payload))
             except Exception as exc:
@@ -11067,6 +12065,15 @@ class HDXFViewerApp:
         edited_paths = {int(index): Path(path) for index, path in view.edited_frame_files.items()}
         total_frames = max(0, frame_stop - frame_start)
         block_count = (total_frames + block_size - 1) // block_size if total_frames else 0
+        effective_mask = mask if config["mode"] == "2d" else static_mask
+        effective_mask_pixels = 0 if effective_mask is None else int(np.count_nonzero(effective_mask))
+        user_mask_pixels = view.canvas.masked_pixel_count()
+        gap_mask_pixels = view.canvas.gap_masked_pixel_count()
+        file_mask = (self._pyfai_detector_mask_for_view(view, tuple(current_frame.shape))
+                     if self.pyfai_use_detector_mask_var.get() else None)
+        file_mask_pixels = 0 if file_mask is None else int(np.count_nonzero(file_mask))
+        analysis_revision = self._pyfai_input_revision
+        self._pyfai_recompute_required = False
         source = {
             "view_id": int(view.view_id),
             "filename": view.archive.path.name,
@@ -11080,6 +12087,12 @@ class HDXFViewerApp:
             "calculation_block_size": int(block_size),
             "calculation_block_count": int(block_count),
             "edited_frames_in_average": int(sum(1 for idx in edited_paths if frame_start <= idx < frame_stop)),
+            "user_mask_pixels": user_mask_pixels,
+            "gap_mask_pixels": gap_mask_pixels,
+            "source_mask_pixels": file_mask_pixels,
+            "effective_mask_pixels": effective_mask_pixels,
+            "source_mask_requested": bool(self.pyfai_use_detector_mask_var.get()),
+            "analysis_revision": analysis_revision,
         }
         self._pyfai_run_serial += 1
         serial = self._pyfai_run_serial
@@ -11118,7 +12131,7 @@ class HDXFViewerApp:
                     # from their captured temporary .npy files.
                     reader = HDF5Archive(archive_path) if archive_kind == "hdf5" else HDXFArchive(archive_path)
                     method = getattr(ai, "integrate1d_ng", None) or getattr(ai, "integrate1d")
-                    reference_r_mm: np.ndarray | None = None
+                    reference_radial: np.ndarray | None = None
                     global_mean: np.ndarray | None = None
                     global_count: np.ndarray | None = None
                     processed_frames = 0
@@ -11151,12 +12164,12 @@ class HDXFViewerApp:
                             common = dict(common_base)
                             common["mask"] = np.ascontiguousarray(frame_mask) if frame_mask is not None else None
                             result = method(frame, config["radial_bins"], **common)
-                            r_mm = np.ascontiguousarray(np.asarray(result.radial, dtype=np.float64))
+                            radial_bins = np.ascontiguousarray(np.asarray(result.radial, dtype=np.float64))
                             intensity = np.ascontiguousarray(np.asarray(result.intensity, dtype=np.float64))
-                            if reference_r_mm is None:
-                                reference_r_mm = r_mm
-                            elif r_mm.shape != reference_r_mm.shape or not np.allclose(
-                                r_mm, reference_r_mm, rtol=1e-10, atol=1e-12, equal_nan=True
+                            if reference_radial is None:
+                                reference_radial = radial_bins
+                            elif radial_bins.shape != reference_radial.shape or not np.allclose(
+                                radial_bins, reference_radial, rtol=1e-10, atol=1e-12, equal_nan=True
                             ):
                                 raise HDXFViewerError(
                                     "pyFAI radial bins changed between frames. "
@@ -11186,17 +12199,15 @@ class HDXFViewerApp:
                             "block_stop": block_stop,
                         }))
 
-                    if reference_r_mm is None or global_mean is None or global_count is None:
+                    if reference_radial is None or global_mean is None or global_count is None:
                         raise HDXFViewerError("No frames were integrated for the all-frame 1D average")
-                    radius_m = np.ascontiguousarray(reference_r_mm * 1.0e-3)
-                    theta_rad = np.ascontiguousarray(
-                        self._pyfai_theta_from_radius_distance(radius_m, config["distance_m"])
+                    display_radial = format_1d_axis(
+                        reference_radial, display_axis=config["one_d_axis"], distance_m=config["distance_m"]
                     )
                     payload = {
                         "kind": "1d",
-                        "radial": theta_rad,
-                        "radius_m": radius_m,
-                        "pyfai_r_mm": reference_r_mm,
+                        "radial": display_radial,
+                        "pyfai_radial": reference_radial,
                         "intensity": self._pyfai_average_intensity_finalize(global_mean, global_count),
                         "valid_frame_counts_per_bin": np.ascontiguousarray(global_count),
                     }
@@ -11238,16 +12249,31 @@ class HDXFViewerApp:
                          f"Averaging all pyFAI 1D profiles · {done}/{total} frames ({percent:.0f}%) · "
                          f"block {block}/{block_total}")
                     )
+                elif kind == "stage":
+                    self.pyfai_status_var.set(str(payload))
                 elif kind == "done":
-                    self._pyfai_result = payload
                     source = payload["source"]
+                    if source.get("analysis_revision") != self._pyfai_input_revision:
+                        self._pyfai_recompute_required = True
+                        # The result was calculated with a mask that changed
+                        # while the background worker was active. Never show
+                        # or export scientifically stale data.
+                        self.pyfai_status_var.set(
+                            "Inputs changed while calculating. Obsolete result discarded; press Run again."
+                        )
+                        continue
+                    self._pyfai_result = payload
                     if payload["kind"] == "notebook_1d":
                         p = payload["profiles"]
                         self.pyfai_status_var.set(
                             f"Notebook 1D (2θ degrees) · {source['average_scope']} · "
                             f"beam ({p['beam_x']:.2f}, {p['beam_y']:.2f}) · "
                             f"base mask {p['base_mask_count']} px · "
-                            f"hot {p['spot_mask_count']} px · sigma {p['sigma_mask_count']} px"
+                            f"hot {p['spot_mask_count']} px · sigma {p['sigma_mask_count']} px · "
+                            f"extra mask {payload['config']['extra_mask_pixels']:,} px "
+                            f"(manual {payload['config']['user_mask_pixels']:,}, "
+                            f"gap {payload['config']['gap_mask_pixels']:,}, "
+                            f"source {payload['config']['source_mask_pixels']:,})"
                         )
                     elif payload["kind"] == "1d":
                         actual = int(source.get("frame_count_averaged", 1))
@@ -11255,12 +12281,18 @@ class HDXFViewerApp:
                         blocks = int(source.get("calculation_block_count", 1))
                         self.pyfai_status_var.set(
                             f"All-frame 1D average complete · {actual} frames · "
-                            f"{blocks} blocks × up to {block_size} · {payload['radial'].size} θ bins"
+                            f"{blocks} blocks × up to {block_size} · {payload['radial'].size} θ bins · "
+                            f"masked {source['effective_mask_pixels']:,} px "
+                            f"(manual {source['user_mask_pixels']:,}, gap {source['gap_mask_pixels']:,}, "
+                            f"source {source['source_mask_pixels']:,})"
                         )
                     else:
                         rows, cols = payload["intensity"].shape
                         self.pyfai_status_var.set(
-                            f"2D cake complete · {cols} radial × {rows} azimuth bins · image {source['frame_index'] + 1}"
+                            f"2D cake complete · {cols} radial × {rows} azimuth bins · "
+                            f"image {source['frame_index'] + 1} · masked {source['effective_mask_pixels']:,} px "
+                            f"(manual {source['user_mask_pixels']:,}, gap {source['gap_mask_pixels']:,}, "
+                            f"source {source['source_mask_pixels']:,})"
                         )
                     self._show_pyfai_result_window()
                 else:
@@ -11292,7 +12324,29 @@ class HDXFViewerApp:
             toolbar = ttk.Frame(window, style="Topbar.TFrame", padding=(10, 8))
             toolbar.pack(fill="x")
             ttk.Label(toolbar, text="INTEGRATION RESULT", style="Brand.TLabel").pack(side="left")
-            ttk.Button(toolbar, text="Export…", style="Secondary.TButton", command=self._export_pyfai_result).pack(side="right")
+            ttk.Button(toolbar, text="Export Data…", style="Secondary.TButton", command=self._export_pyfai_result).pack(side="right", padx=(6, 0))
+            ttk.Button(toolbar, text="Save Chart…", style="Secondary.TButton", command=self._export_pyfai_chart).pack(side="right")
+            if self._pyfai_result.get("kind") == "notebook_1d" and self._pyfai_result.get("mask_comparison"):
+                controls = ttk.Frame(window, style="Topbar.TFrame", padding=(10, 4))
+                controls.pack(fill="x")
+                ttk.Label(controls, text="Mask comparison", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+                self._pyfai_compare_view_var = tk.StringVar(master=window, value="Before / After")
+                comparison_selector = ttk.Combobox(
+                    controls, textvariable=self._pyfai_compare_view_var,
+                    values=("Before / After", "Difference Δ", "Notebook 3 curves"),
+                    state="readonly", width=21,
+                )
+                comparison_selector.pack(side="left", padx=(0, 16))
+                ttk.Label(controls, text="Method", style="Muted.TLabel").pack(side="left", padx=(0, 8))
+                self._pyfai_compare_track_var = tk.StringVar(master=window, value=NOTEBOOK_COMPARE_TRACKS[0][1])
+                method_selector = ttk.Combobox(
+                    controls, textvariable=self._pyfai_compare_track_var,
+                    values=tuple(label for _, label in NOTEBOOK_COMPARE_TRACKS),
+                    state="readonly", width=31,
+                )
+                method_selector.pack(side="left")
+                for selector in (comparison_selector, method_selector):
+                    selector.bind("<<ComboboxSelected>>", lambda _event: self._draw_pyfai_result())
             canvas = tk.Canvas(window, background=UI_CANVAS, highlightthickness=0)
             canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
             canvas.bind("<Configure>", lambda _event: self._draw_pyfai_result())
@@ -11306,7 +12360,8 @@ class HDXFViewerApp:
     @staticmethod
     def _pyfai_axis_label(unit: str) -> str:
         return {
-            "theta_custom_rad": "θ = ½ tan⁻¹(R/L) (rad)",
+            "theta_custom_rad": "Legacy θ = ½ tan⁻¹(R/L) (rad)",
+            "theta_corrected_rad": "θ (rad; geometry-corrected)",
             "q_A^-1": "q (Å⁻¹)",
             "q_nm^-1": "q (nm⁻¹)",
             "2th_deg": "2θ (deg)",
@@ -11314,8 +12369,123 @@ class HDXFViewerApp:
             "r_mm": "Radius (mm)",
         }.get(unit, unit)
 
+    def _draw_notebook_mask_comparison(self, canvas: tk.Canvas, result: dict,
+                                       width: int, height: int, mode: str) -> None:
+        """Show exactly aligned Notebook before/after curves or signed difference.
+
+        The plot never claims that differences outside the configured radial
+        range are zero. Empty radial bins are gaps rather than plotted zeros.
+        """
+        comparison = result["mask_comparison"]
+        choices = {label: key for key, label in NOTEBOOK_COMPARE_TRACKS}
+        selection = getattr(self, "_pyfai_compare_track_var", None)
+        label = selection.get() if selection is not None else NOTEBOOK_COMPARE_TRACKS[0][1]
+        key = choices.get(label, "included")
+        data = comparison["tracks"][key]
+        source = result["source"]
+        canvas.create_text(18, 13, anchor="nw", fill=UI_TEXT,
+                           font=("Segoe UI", 10, "bold"),
+                           text=f"Notebook Mask comparison · {source['filename']} · {source['average_scope']}")
+        canvas.create_text(18, 34, anchor="nw", fill=UI_TEXT_MUTED,
+                           font=("Segoe UI", 9),
+                           text=(f"Method: {label}  ·  Manual Mask: {comparison['manual_pixels']:,} px"
+                                 f"  ·  Newly excluded from base: {comparison['newly_excluded_pixels']:,} px"))
+        canvas.create_text(18, 53, anchor="nw", fill=UI_TEXT_MUTED,
+                           font=("Segoe UI", 9),
+                           text=(f"Bins changed: {data['changed_bins']:,}/{data['compared_bins']:,}"
+                                 f"  ·  Bins made empty: {data['newly_empty_bins']:,}"
+                                 f"  ·  Max |Δ|: {data['max_abs_delta']:.6g}"
+                                 f"  ·  Mean |Δ|: {data['mean_abs_delta']:.6g}"))
+        difference = mode == "Difference Δ"
+        series = ([
+            (data["delta"], "Δ = After − Before", "#FBBF24"),
+        ] if difference else [
+            (data["before"], "Before manual Mask", "#60A5FA"),
+            (data["after"], "After manual Mask", "#F472B6"),
+        ])
+        radius = data["radius_px"]
+        theta = data["two_theta_deg"]
+        outside_center = radius > float(result["config"]["exclude_radius_px"])
+        for i, (_, legend, color) in enumerate(series):
+            lx = 78 + i * 200
+            canvas.create_line(lx, 88, lx + 22, 88, fill=color, width=3)
+            canvas.create_text(lx + 27, 88, text=legend, anchor="w", fill=color,
+                               font=("Segoe UI", 9))
+        shown = outside_center & np.isfinite(theta)
+        if difference:
+            shown &= np.isfinite(data["delta"])
+        else:
+            shown &= np.isfinite(data["before"]) | np.isfinite(data["after"])
+        if not np.any(shown):
+            canvas.create_text(width/2, height/2,
+                               text="No comparable radial bins outside center exclusion",
+                               fill=UI_WARNING)
+            return
+        xdata = theta[shown]
+        xmin, xmax = float(np.min(xdata)), float(np.max(xdata))
+        if xmax <= xmin:
+            xmax = xmin + 1.
+        all_y = np.concatenate([v[shown & np.isfinite(v)] for v, _, _ in series])
+        if not all_y.size:
+            canvas.create_text(width/2, height/2, text="No finite comparison values", fill=UI_WARNING)
+            return
+        if difference:
+            magnitude = float(np.max(np.abs(all_y)))
+            magnitude = max(magnitude * 1.1, 1e-12)
+            ymin, ymax = -magnitude, magnitude
+        else:
+            ymin = min(0., float(np.min(all_y)))
+            ymax = max(1e-9, float(np.percentile(all_y, 99.0)) * 1.4)
+            if ymax <= ymin:
+                ymax = ymin + 1.
+        left, top, right, bottom = 78., 117., max(110., width-25.), max(140., height-60.)
+        if right <= left or bottom <= top:
+            return
+        canvas.create_line(left, bottom, right, bottom, fill=UI_BORDER)
+        canvas.create_line(left, top, left, bottom, fill=UI_BORDER)
+        xf = (right-left)/(xmax-xmin)
+        yf = (bottom-top)/(ymax-ymin)
+        if difference:
+            zy = bottom-(0.-ymin)*yf
+            canvas.create_line(left, zy, right, zy, fill="#42516A", dash=(4, 4))
+        for values, _legend, color in series:
+            valid = outside_center & np.isfinite(theta) & np.isfinite(values)
+            indices = np.flatnonzero(valid)
+            if indices.size < 2:
+                continue
+            # Split at masked-empty bins; don't interpolate across gaps.
+            boundaries = np.flatnonzero(np.diff(indices) > 1) + 1
+            for group in np.split(indices, boundaries):
+                if group.size < 2:
+                    continue
+                stride = max(1, int(np.ceil(group.size/max(500, 2*(right-left)))))
+                sampled = group[::stride]
+                if sampled[-1] != group[-1]:
+                    sampled = np.r_[sampled, group[-1]]
+                coords = []
+                for idx in sampled:
+                    xv, yv = float(theta[idx]), float(values[idx])
+                    coords.extend((left+(xv-xmin)*xf,
+                                   bottom-(min(ymax, max(ymin, yv))-ymin)*yf))
+                if len(coords) >= 4:
+                    canvas.create_line(*coords, fill=color, width=1.6)
+        canvas.create_text((left+right)/2, height-23, text="2θ (degrees)", fill=UI_TEXT_MUTED)
+        canvas.create_text(19, (top+bottom)/2,
+                           text="Δ intensity (after − before)" if difference else "Mean intensity per ring",
+                           angle=90, fill=UI_TEXT_MUTED)
+        canvas.create_text(left, bottom+8, anchor="nw", text=f"{xmin:.4g}°", fill=UI_TEXT_DIM)
+        canvas.create_text(right, bottom+8, anchor="ne", text=f"{xmax:.4g}°", fill=UI_TEXT_DIM)
+        canvas.create_text(left-9, bottom, anchor="e", text=f"{ymin:.4g}", fill=UI_TEXT_DIM)
+        canvas.create_text(left-9, top, anchor="e", text=f"{ymax:.4g}", fill=UI_TEXT_DIM)
+
     def _draw_notebook_reference_result(self, canvas: tk.Canvas, result: dict, width: int, height: int) -> None:
         """Plot notebook's three 2theta curves with spike-robust display limits."""
+        comparison = result.get("mask_comparison")
+        mode_var = getattr(self, "_pyfai_compare_view_var", None)
+        mode = mode_var.get() if mode_var is not None else "Notebook 3 curves"
+        if comparison and mode in ("Before / After", "Difference Δ"):
+            self._draw_notebook_mask_comparison(canvas, result, width, height, mode)
+            return
         p = result["profiles"]
         cfg = result["config"]
         source = result["source"]
@@ -11424,7 +12594,7 @@ class HDXFViewerApp:
                 coords.extend((left + (float(xv) - xmin) * sx, bottom - (float(yv) - ymin) * sy))
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill=UI_ACCENT, width=2, smooth=False)
-            canvas.create_text((left + right) / 2, height - 24, text=self._pyfai_axis_label("theta_custom_rad"), fill=UI_TEXT_MUTED)
+            canvas.create_text((left + right) / 2, height - 24, text=self._pyfai_axis_label(str(config.get("one_d_axis") or "theta_custom_rad")), fill=UI_TEXT_MUTED)
             ylabel = "Average intensity"
             canvas.create_text(18, (top + bottom) / 2, text=ylabel, fill=UI_TEXT_MUTED, angle=90)
             canvas.create_text(left, bottom + 8, anchor="nw", text=f"{xmin:.5g}", fill=UI_TEXT_DIM)
@@ -11462,9 +12632,61 @@ class HDXFViewerApp:
             canvas.create_text(area_left, area_bottom + 8, anchor="nw", text=f"{radial[0]:.5g}", fill=UI_TEXT_DIM)
             canvas.create_text(area_right, area_bottom + 8, anchor="ne", text=f"{radial[-1]:.5g}", fill=UI_TEXT_DIM)
         if azimuth.size:
-            canvas.create_text(area_left - 8, area_bottom, anchor="e", text=f"{azimuth[0]:.5g}°", fill=UI_TEXT_DIM)
-            canvas.create_text(area_left - 8, area_top, anchor="e", text=f"{azimuth[-1]:.5g}°", fill=UI_TEXT_DIM)
+            # The displayed raster keeps source row 0 at the top; label that
+            # row with azimuth[0], not the last azimuth value.
+            canvas.create_text(area_left - 8, area_bottom, anchor="e", text=f"{azimuth[-1]:.5g}°", fill=UI_TEXT_DIM)
+            canvas.create_text(area_left - 8, area_top, anchor="e", text=f"{azimuth[0]:.5g}°", fill=UI_TEXT_DIM)
         canvas.create_text(width - 20, 14, anchor="ne", text=f"display {lo:.4g} … {hi:.4g}", fill=UI_TEXT_DIM)
+
+    def _export_pyfai_chart(self) -> None:
+        """Save the *currently selected* integration chart, not its raw arrays.
+
+        This is independent of the existing CSV/NPZ Export Data action.
+        The source arrays, detector files, and scientific Mask values are not
+        changed. A stale result is never available after Mask invalidation.
+        """
+        result = self._pyfai_result
+        if result is None:
+            messagebox.showinfo("pyFAI", "Run an integration first.", parent=self.root)
+            return
+        src = result["source"]
+        stem = re.sub(r'[<>:"/\\|?*]', "_", Path(src["filename"]).stem)
+        kind = result["kind"]
+        if kind == "notebook_1d":
+            suffix = "notebook_reference"
+        elif kind == "1d":
+            suffix = "pyfai_1d_allframe"
+        else:
+            suffix = f"pyfai_2d_frame_{int(src['frame_index']) + 1:06d}"
+        window = self._pyfai_result_window
+        parent = window if window is not None and window.winfo_exists() else self.root
+        path = filedialog.asksaveasfilename(
+            parent=parent, title="Save integration chart",
+            defaultextension=".png", initialfile=f"{stem}_{suffix}.png",
+            filetypes=[
+                ("PNG image", "*.png"), ("JPEG image", "*.jpg"),
+                ("SVG vector", "*.svg"), ("PDF document", "*.pdf"),
+            ],
+        )
+        if not path:
+            return
+        mode_var = getattr(self, "_pyfai_compare_view_var", None)
+        track_var = getattr(self, "_pyfai_compare_track_var", None)
+        mode = mode_var.get() if mode_var is not None else (
+            "Before / After" if kind == "notebook_1d" and result.get("mask_comparison")
+            else "Notebook 3 curves"
+        )
+        choices = {label: key for key, label in NOTEBOOK_COMPARE_TRACKS}
+        track = choices.get(track_var.get() if track_var is not None else "", "included")
+        try:
+            saved = export_integration_chart(
+                result, path, comparison_mode=mode, comparison_track=track,
+            )
+        except Exception as exc:
+            self.pyfai_status_var.set(f"Chart export failed · {type(exc).__name__}: {exc}")
+            messagebox.showerror("Save integration chart", f"Could not save chart:\n{exc}", parent=parent)
+            return
+        self.pyfai_status_var.set(f"Chart saved · {saved.name}")
 
     def _export_pyfai_result(self) -> None:
         result = self._pyfai_result
@@ -11486,22 +12708,43 @@ class HDXFViewerApp:
                 return
             profiles = result["profiles"]
             names = ("included", "spots_masked", "sigma_clipped")
+            comparison = result.get("mask_comparison")
             reference = profiles["included"]
-            n = len(reference["radius_px"])
+            n = max(len(reference["radius_px"]),
+                    max((len(a["radius_px"]) for a in comparison["tracks"].values()), default=0)
+                    if comparison else 0)
             with open(path, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(["r_px", "2theta_deg",
-                                 "included_mean", "included_count",
-                                 "hotspot_masked_mean", "hotspot_masked_count",
-                                 "sigma_clipped_mean", "sigma_clipped_count"])
+                header = ["r_px", "2theta_deg", "included_mean", "included_count",
+                          "hotspot_masked_mean", "hotspot_masked_count",
+                          "sigma_clipped_mean", "sigma_clipped_count"]
+                if comparison:
+                    for name in names:
+                        header.extend([f"{name}_before_manual_mask_mean",
+                                       f"{name}_after_manual_mask_mean",
+                                       f"{name}_delta_after_minus_before",
+                                       f"{name}_before_count", f"{name}_after_count"])
+                writer.writerow(header)
                 for i in range(n):
-                    row = [reference["radius_px"][i], reference["two_theta_deg"][i]]
+                    if i < len(reference["radius_px"]):
+                        row = [reference["radius_px"][i], reference["two_theta_deg"][i]]
+                    else:
+                        c = comparison["tracks"]["included"]
+                        row = [c["radius_px"][i], c["two_theta_deg"][i]]
                     for name in names:
                         arr = profiles[name]
                         if i < len(arr["radius_px"]):
                             row.extend([arr["intensity"][i], arr["count"][i]])
                         else:
                             row.extend([float("nan"), 0])
+                    if comparison:
+                        for name in names:
+                            c = comparison["tracks"][name]
+                            if i < len(c["radius_px"]):
+                                row.extend([c["before"][i], c["after"][i], c["delta"][i],
+                                            c["before_count"][i], c["after_count"][i]])
+                            else:
+                                row.extend([float("nan"), float("nan"), float("nan"), 0, 0])
                     writer.writerow(row)
         elif result["kind"] == "1d":
             actual = int(source.get("frame_count_averaged", 1))
@@ -11521,7 +12764,7 @@ class HDXFViewerApp:
             with open(path, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow([
-                    self._pyfai_axis_label("theta_custom_rad"),
+                    self._pyfai_axis_label(str(config.get("one_d_axis") or "theta_custom_rad")),
                     "average_intensity",
                     "valid_frame_count",
                 ])
@@ -11560,15 +12803,262 @@ class HDXFViewerApp:
             return "hdf5"
         return None
 
+    def _image_export_format_changed(self, _event: tk.Event | None = None) -> None:
+        """Raw scientific formats cannot contain annotations."""
+        can_annotate = self.image_export_format_var.get() in (PNG_DISPLAY, JPG_DISPLAY)
+        if not can_annotate:
+            self.image_export_overlay_var.set(False)
+        self.image_export_overlay_check.configure(state="normal" if can_annotate else "disabled")
+        self.image_export_status_var.set(
+            "PNG/JPEG use 8-bit display contrast; JPEG is lossy. "
+            "NPY preserves values and dtype; 16-bit PNG requires uint16 pixels."
+        )
+
+    @staticmethod
+    def _snapshot_image_export_overlays(view: InternalViewState) -> OverlayState:
+        canvas = view.canvas
+        roi_mask = canvas.roi_mask() if canvas.get_roi() is not None else None
+        return OverlayState(
+            manual_mask=canvas.get_analysis_mask(view.archive.frame_shape),
+            roi_bbox=canvas.get_roi(),
+            roi_shape=canvas.get_roi_shape(),
+            roi_mask=None if roi_mask is None else roi_mask.copy(),
+            roi_points=tuple(canvas.roi_points),
+            roi_inner_diameter=int(canvas.roi_inner_diameter),
+            beam_center=canvas.manual_beam_center,
+            resolution_geometry=None if canvas.resolution_geometry is None else dict(canvas.resolution_geometry),
+            show_resolution_rings=bool(canvas.show_resolution_rings),
+        )
+
+    def _image_export_settings(self) -> dict[str, Any] | None:
+        view = self.active_view
+        if view is None or view.archive is None or view.current_frame is None:
+            messagebox.showwarning("Export", "Open a detector image first.", parent=self.root)
+            return None
+        kind = self.image_export_format_var.get()
+        if kind not in EXPORT_FORMATS:
+            messagebox.showerror("Export", "Choose a supported output format.", parent=self.root)
+            return None
+        if kind == PNG_UINT16 and np.dtype(view.archive.dtype) != np.dtype('uint16'):
+            messagebox.showerror(
+                "16-bit PNG unavailable",
+                "This detector image is not uint16. Choose NPY to preserve its original dtype.",
+                parent=self.root,
+            )
+            return None
+        include = bool(self.image_export_overlay_var.get()) and kind in (PNG_DISPLAY, JPG_DISPLAY)
+        return {
+            "view": view, "archive": view.archive, "kind": kind,
+            "low": float(view.display_min), "high": float(view.display_max),
+            "invert": bool(view.invert), "overlays": (
+                self._snapshot_image_export_overlays(view) if include else None
+            ),
+            "bright_enabled": bool(include and view.canvas.bright_spots_enabled),
+            "bright_options": view.canvas.bright_spot_options,
+        }
+
+    def _export_one_image(self, settings: dict[str, Any], index: int, destination: Path) -> None:
+        view = settings["view"]
+        if view.archive is not settings["archive"] or view not in self.views:
+            raise HDXFViewerError("Detector view/source changed during export")
+        # Live-edit values, if present, take precedence over archive originals.
+        # Current image is already in memory, avoiding an unnecessary HDF5 read.
+        if index == view.current_frame_index and view.current_frame is not None:
+            frame = view.current_frame
+        else:
+            frame = self._load_view_frame(view, index)
+        overlays = settings["overlays"]
+        if overlays is not None and settings["bright_enabled"]:
+            boxes = detect_bright_spots(frame, settings["bright_options"],
+                                        excluded_mask=overlays.manual_mask)
+            overlays = replace(overlays, bright_spot_boxes=tuple(boxes))
+        # Render to a sibling temporary file and atomically move into place.
+        # A failed image encoder must never truncate/delete an existing output.
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent, prefix=".hdxf_export_",
+                suffix=file_extension(settings["kind"]), delete=False,
+            ) as temporary:
+                temp_path = Path(temporary.name)
+            export_frame(frame, temp_path, settings["kind"],
+                         low=settings["low"], high=settings["high"],
+                         invert=settings["invert"], overlays=overlays)
+            if self._image_export_job is not None and destination.exists():
+                raise FileExistsError(f"Refusing to overwrite {destination.name}")
+            os.replace(temp_path, destination)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    def _export_current_frame(self) -> None:
+        if self._image_export_job is not None:
+            return
+        settings = self._image_export_settings()
+        if settings is None:
+            return
+        view = settings["view"]
+        kind = settings["kind"]
+        ext = file_extension(kind)
+        filename = filedialog.asksaveasfilename(
+            parent=self.root, title="Export current detector frame",
+            initialfile=frame_filename(view.archive.path.stem, view.current_frame_index + 1, kind),
+            initialdir=str(view.archive.path.parent),
+            defaultextension=ext,
+            filetypes=[(f"{kind} (*{ext})", f"*{ext}"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.suffix == "":
+            destination = destination.with_suffix(ext)
+        try:
+            self._export_one_image(settings, view.current_frame_index, destination)
+        except Exception as exc:
+            messagebox.showerror("Image export failed", f"{type(exc).__name__}: {exc}", parent=self.root)
+            self.image_export_status_var.set("Export failed")
+            return
+        self.image_export_status_var.set(f"Saved {destination.name} (frame {view.current_frame_index + 1})")
+        self.status_var.set(f"Exported {destination.name}")
+
+    def _export_frame_range(self) -> None:
+        if self._image_export_job is not None:
+            return
+        settings = self._image_export_settings()
+        if settings is None:
+            return
+        view = settings["view"]
+        try:
+            indices = frame_indices(
+                int(self.image_export_start_var.get()), int(self.image_export_end_var.get()),
+                int(self.image_export_step_var.get()), view.archive.frame_count,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid frame range", str(exc), parent=self.root)
+            return
+        count = len(indices)
+        if count > 1000 and not messagebox.askyesno(
+            "Large image export", f"Export {count:,} separate image files? This may require significant disk space.",
+            parent=self.root,
+        ):
+            return
+        folder = filedialog.askdirectory(
+            parent=self.root, title="Choose folder for exported frames",
+            initialdir=str(view.archive.path.parent), mustexist=True,
+        )
+        if not folder:
+            return
+        folder = Path(folder)
+        kind = settings["kind"]
+        # Never overwrite an unrelated experiment's files in batch mode.
+        collisions = [i for i in indices if (folder / frame_filename(view.archive.path.stem, i+1, kind)).exists()]
+        if collisions:
+            messagebox.showerror(
+                "Existing export files",
+                f"{len(collisions)} destination file(s) already exist in the selected folder. "
+                "Choose a different or empty folder; batch export never overwrites files.",
+                parent=self.root,
+            )
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Export detector frames")
+        dialog.geometry("450x145")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.configure(background=UI_BG)
+        label = tk.StringVar(master=dialog, value=f"Exporting 0 / {count} frames…")
+        ttk.Label(dialog, text="IMAGE EXPORT", style="InspectorTitle.TLabel").pack(anchor="w", padx=15, pady=(12, 5))
+        ttk.Label(dialog, textvariable=label, style="ReadoutValue.TLabel").pack(anchor="w", padx=15)
+        ttk.Button(dialog, text="Cancel", style="Secondary.TButton",
+                   command=self._cancel_image_export).pack(anchor="e", padx=15, pady=(12, 0))
+        dialog.protocol("WM_DELETE_WINDOW", self._cancel_image_export)
+        job = dict(settings, indices=iter(indices), total=count, completed=0,
+                   folder=folder, dialog=dialog, label=label,
+                   cancelled=False, after_id=None)
+        self._image_export_job = job
+        self.image_export_current_button.configure(state="disabled")
+        self.image_export_range_button.configure(state="disabled")
+        self._image_export_step()
+
+    def _cancel_image_export(self, *, force: bool = False) -> None:
+        job = getattr(self, "_image_export_job", None)
+        if job is None:
+            return
+        job["cancelled"] = True
+        if force:
+            if job.get("after_id") is not None:
+                try:
+                    self.root.after_cancel(job["after_id"])
+                except tk.TclError:
+                    pass
+            self._finish_image_export("Cancelled")
+
+    def _image_export_step(self) -> None:
+        job = self._image_export_job
+        if job is None:
+            return
+        job["after_id"] = None
+        if job["cancelled"]:
+            self._finish_image_export("Cancelled")
+            return
+        try:
+            index = next(job["indices"])
+        except StopIteration:
+            self._finish_image_export("Completed")
+            return
+        destination = job["folder"] / frame_filename(job["archive"].path.stem, index + 1, job["kind"])
+        try:
+            # Guard against external files being created while exporting.
+            if destination.exists():
+                raise FileExistsError(f"Refusing to overwrite {destination.name}")
+            self._export_one_image(job, index, destination)
+            job["completed"] += 1
+            job["label"].set(f"Saved {job['completed']:,} / {job['total']:,} frames · last: {index+1}")
+        except Exception as exc:
+            self._finish_image_export("Failed")
+            messagebox.showerror("Batch image export failed", f"Frame {index+1}: {type(exc).__name__}: {exc}",
+                                 parent=self.root)
+            return
+        # Schedule at most one image per main-loop turn. HDF5 handles never
+        # cross threads; cancel and UI events run between frame reads.
+        job["after_id"] = self.root.after(1, self._image_export_step)
+
+    def _finish_image_export(self, outcome: str) -> None:
+        job = self._image_export_job
+        if job is None:
+            return
+        self._image_export_job = None
+        if job.get("after_id") is not None:
+            try:
+                self.root.after_cancel(job["after_id"])
+            except tk.TclError:
+                pass
+        try:
+            job["dialog"].destroy()
+        except tk.TclError:
+            pass
+        status = f"{outcome}: {job['completed']:,} / {job['total']:,} frame(s) saved"
+        self.image_export_status_var.set(status)
+        self.status_var.set(f"Image export · {status}")
+        if hasattr(self, "image_export_current_button"):
+            self._refresh_tools_sidebar()
+
     def _refresh_tools_sidebar(self) -> None:
         """Refresh current file/frame details and live-editor availability."""
         if not hasattr(self, "tools_apply_button"):
             return
         view = self.active_view
+        self._refresh_bright_spot_status()
+        self._refresh_gap_status()
         family = self._active_processing_family()
         enabled = view is not None and view.archive is not None and family is not None
         state = "normal" if enabled else "disabled"
         for name in (
+            "gap_preview_button",
+            "gap_apply_button",
+            "gap_clear_button",
+            "image_export_current_button",
+            "image_export_range_button",
             "tools_apply_button",
             "tools_sum_button",
             "tools_subtract_button",
@@ -11578,6 +13068,12 @@ class HDXFViewerApp:
             if widget is not None:
                 widget.configure(state=state)
 
+        if hasattr(self, "gap_apply_button"):
+            self.gap_apply_button.configure(state="normal" if enabled and
+                view is not None and view.canvas.gap_preview is not None else "disabled")
+            self.gap_clear_button.configure(state="normal" if enabled and
+                view is not None and (view.canvas.gap_mask is not None or
+                                      view.canvas.gap_preview is not None) else "disabled")
         dirty = bool(view is not None and view.dirty)
         if hasattr(self, "tools_revert_frame_button"):
             current_dirty = bool(view is not None and view.current_frame_index in view.edited_frame_files)
@@ -12759,6 +14255,31 @@ class HDXFViewerApp:
                 return False
             return self._pyfai_add_calibration_point(view, pixel)
 
+        def mask_callback(count: int) -> None:
+            view = holder.get("view")
+            if view is None:
+                return
+            if view is not self.active_view:
+                self.activate_view(view, refresh=False)
+            self.status_var.set(
+                f"Manual analysis mask: {count:,} excluded pixels · "
+                "applies to pyFAI / Notebook integration · original data unchanged"
+            )
+            self._pyfai_invalidate_mask_result()
+
+        def gap_mask_callback(count: int) -> None:
+            view = holder.get("view")
+            if view is None:
+                return
+            if view is not self.active_view:
+                self.activate_view(view, refresh=False)
+            self.status_var.set(
+                f"Applied Module Gap Mask: {count:,} pixels; manual mask: "
+                f"{view.canvas.masked_pixel_count():,} pixels preserved. Re-run pyFAI / Notebook."
+            )
+            self._pyfai_invalidate_mask_result()
+            self._refresh_gap_status()
+
         def roi_callback(roi: tuple[int, int, int, int] | None) -> None:
             view = holder.get("view")
             if view is None or view is not self.active_view:
@@ -12782,6 +14303,16 @@ class HDXFViewerApp:
                         f"X2={x + width - 1}, Y2={y + height - 1} · source HDF5/HDXF unchanged"
                     )
 
+        def bright_spots_callback(count: int, error: str | None) -> None:
+            view = holder.get("view")
+            if view is not None and view is self.active_view:
+                if error:
+                    self.bright_spots_status_var.set(f"Detection unavailable: {error}")
+                else:
+                    self.bright_spots_status_var.set(
+                        f"{count} bright region(s) · display only, no masking"
+                    )
+
         canvas = ImageCanvas(
             host,
             status_callback,
@@ -12790,8 +14321,16 @@ class HDXFViewerApp:
             roi_callback,
             pixel_edit_callback,
             calibration_point_callback,
+            mask_callback,
+            bright_spots_callback,
+            gap_mask_callback,
         )
         canvas.pack(side="top", fill="both", expand=True)
+        canvas.set_bright_spot_detection(
+            self.bright_spots_enabled_var.get(),
+            self._bright_valid_sensitivity,
+            self._bright_valid_minimum,
+        )
         template = self.active_view
         if template is None:
             try:
@@ -13402,6 +14941,8 @@ class HDXFViewerApp:
         # Clear after the new file has opened successfully; a failed open keeps
         # the previous file and its temporary anchor untouched.
         view.canvas.clear_manual_beam_center(notify=False)
+        view.canvas.clear_user_mask(notify=False)
+        view.canvas.clear_gap_mask(notify=False)
         view.canvas.clear_roi(notify=False)
         view.archive = new_archive
         view.source_path = path
@@ -13422,6 +14963,9 @@ class HDXFViewerApp:
         self._histogram_logs_cache = None
         self.frame_spin.configure(from_=1, to=max(1, view.archive.frame_count))
         self._set_frame_controls(0)
+        self.image_export_start_var.set("1")
+        self.image_export_end_var.set(str(min(10, view.archive.frame_count)))
+        self.image_export_step_var.set("1")
         self._refresh_resolution_geometry(view)
         self._sync_roi_sidebar_from_view(view)
         self.auto_contrast()
@@ -13449,6 +14993,7 @@ class HDXFViewerApp:
         )
 
     def _shutdown_resources(self) -> None:
+        self._cancel_image_export(force=True)
         if self._pyfai_poll_after_id is not None:
             try:
                 self.root.after_cancel(self._pyfai_poll_after_id)
@@ -14765,6 +16310,7 @@ def configure_modern_theme(root: tk.Tk, *, ui_scale: float = 1.0) -> None:
     style.configure("FieldLabel.TLabel", background=UI_CARD, foreground=UI_TEXT_DIM, font=("Segoe UI", 8, "bold"))
     style.configure("Readout.TLabel", background=UI_CARD, foreground=UI_TEXT, font=("Consolas", 9, "bold"))
     style.configure("ReadoutMuted.TLabel", background=UI_CARD, foreground=UI_TEXT_MUTED, font=("Segoe UI", 8))
+    style.configure("GapFeedback.TLabel", background=UI_CARD, foreground="#F8D27A", font=("Segoe UI", 9, "bold"))
     style.configure("Status.TLabel", background=UI_SURFACE, foreground=UI_TEXT_MUTED)
     style.configure("StatusChip.TLabel", background=UI_ACCENT_DARK, foreground=UI_ACCENT, padding=(px(8), px(3)), font=("Segoe UI", 8, "bold"))
 
